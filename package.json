@@ -1,0 +1,17 @@
+{
+  "name": "jimeng-browser-automation",
+  "private": true,
+  "version": "0.1.0",
+  "type": "commonjs",
+  "scripts": {
+    "login": "node scripts/jimeng-browser.js login",
+    "snapshot": "node scripts/jimeng-browser.js snapshot",
+    "open-tool": "node scripts/jimeng-browser.js open-tool",
+    "generate": "node scripts/jimeng-browser.js generate",
+    "record-status": "node scripts/jimeng-browser.js record-status",
+    "download-record": "node scripts/jimeng-browser.js download-record"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}

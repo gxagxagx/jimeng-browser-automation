@@ -1,0 +1,4 @@
+interface:
+  display_name: "JiMeng Browser"
+  short_description: "Automate JiMeng image and video creation in browser"
+  default_prompt: "Use $jimeng-browser-automation to ensure JiMeng login, submit image or video tasks, check status by record-id, and download finished results."
