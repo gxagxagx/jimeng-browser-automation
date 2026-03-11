@@ -1,37 +1,34 @@
 # JiMeng Browser Automation
 
-Playwright-based browser automation for [JiMeng AI](https://jimeng.jianying.com) (即梦AI by ByteDance). Designed as a skill for AI agents and [OpenClaw](https://github.com/anthropics/openclaw).
+Playwright-based browser automation for [JiMeng AI](https://jimeng.jianying.com) (即梦AI), including hot video models such as `Seedance 2.0 Fast` and `Seedance 2.0`.
 
-Supports Douyin QR-code login, image/video generation, task status polling by `record-id`, and downloading completed results — all driven from the command line.
+It supports:
 
-## Quick Start
+- Douyin QR login
+- image generation
+- video generation
+- `record-id` based status checks
+- queued video cancelation
+- image/video download
+
+This repo is designed for agent use, but it is also usable directly from the command line.
+
+## Install
 
 ```bash
 npm install
 npx playwright install chromium
 ```
 
-First-time login (saves a persistent browser profile under `runtime/`):
+## Quick start
+
+Login first:
 
 ```bash
 node scripts/jimeng-browser.js login
 ```
 
-The script saves a QR screenshot to `runtime/artifacts/`. Scan it with Douyin to authenticate. Subsequent runs reuse the stored session automatically.
-
-## Commands
-
-### Core Workflow
-
-#### 1. Login
-
-```bash
-node scripts/jimeng-browser.js login
-```
-
-Opens JiMeng, triggers the Douyin OAuth popup, saves QR and popup screenshots under `runtime/artifacts/`. Waits for the user to scan and approve.
-
-#### 2. Generate Image
+Generate an image:
 
 ```bash
 node scripts/jimeng-browser.js generate \
@@ -40,11 +37,7 @@ node scripts/jimeng-browser.js generate \
   --json true
 ```
 
-Returns `recordId` on success. Each image task produces **4 result images**.
-
-Optional flags: `--model`, `--aspect`, `--resolution`, `--reference-file`
-
-#### 3. Generate Video
+Generate a video:
 
 ```bash
 node scripts/jimeng-browser.js generate \
@@ -53,13 +46,7 @@ node scripts/jimeng-browser.js generate \
   --json true
 ```
 
-Returns `recordId` on success. Each video task produces **1 MP4**.
-
-Optional flags: `--model`, `--reference-mode`, `--duration`, `--aspect`, `--resolution`, `--reference-file`, `--first-frame-file`, `--last-frame-file`, `--submit-retries`, `--submit-retry-delay-ms`, `--record-id-wait-ms`
-
-Supported reference modes: `全能参考`, `首尾帧`, `智能多帧`, `主体参考`
-
-#### 4. Check Task Status
+Check status:
 
 ```bash
 node scripts/jimeng-browser.js record-status \
@@ -67,20 +54,7 @@ node scripts/jimeng-browser.js record-status \
   --json true
 ```
 
-Returns structured fields:
-
-| Field | Description |
-|-------|-------------|
-| `status` | Human-readable status string |
-| `isComplete` | `true` when results are ready |
-| `isFailed` | `true` when the task has failed |
-| `progressPercent` | Generation progress (0–100) |
-| `queuePosition` / `queueTotal` | Queue position if queued |
-| `etaText` | Estimated time remaining |
-| `auditFailureType` | `input-policy`, `output-policy`, `capacity-limit`, or `null` |
-| `failureReason` | Failure message from JiMeng |
-
-#### 5. Download Result
+Download result:
 
 ```bash
 node scripts/jimeng-browser.js download-record \
@@ -89,156 +63,174 @@ node scripts/jimeng-browser.js download-record \
   --json true
 ```
 
-- Image records: downloads **4 PNG** files
-- Video records: downloads **1 MP4** file
-- Older records can be recovered through the JiMeng history API fallback
-
-### Maintenance Commands
-
-These are useful for debugging, not part of the normal agent workflow:
+Cancel a queued video task:
 
 ```bash
-# Capture page screenshot + DOM snapshot
-node scripts/jimeng-browser.js snapshot --tool image
-
-# Open a tool page in the browser
-node scripts/jimeng-browser.js open-tool --tool video
-
-# Find a specific record card
-node scripts/jimeng-browser.js find-record --record-id <record-id>
-
-# List locally tracked records
-node scripts/jimeng-browser.js list-records
+node scripts/jimeng-browser.js cancel-record \
+  --record-id <record-id> \
+  --json true
 ```
 
-## Agent Integration
+## Normal workflow
 
-Typical agent/OpenClaw workflow:
+1. `login`
+2. `generate`
+3. `record-status`
+4. `download-record`
 
-```
-1. login              → Ensure session is valid (show QR if needed)
-2. generate           → Submit task, get recordId
-3. record-status      → Poll until isComplete=true or isFailed=true
-4. download-record    → Download finished files
-```
+Use `cancel-record` only for queued video tasks you want to stop.
 
-All core commands support `--json true` for structured output. When enabled:
-- Success: `{ "ok": true, "command": "...", "recordId": "...", ... }`
-- Failure: `{ "ok": false, "error": "..." }`
-- Progress logs go to stderr, JSON result goes to stdout
+Always track tasks by `record-id`, not by page order.
 
-Always identify tasks by `record-id`, not by page order.
+## Common options
 
-### Example: Full Image Generation Flow
+### Image
+
+Optional flags:
+
+- `--model`
+- `--aspect`
+- `--resolution`
+- `--reference-file`
+
+Observed image options:
+
+- Models: `图片5.0 Lite`, `图片4.6`, `图片 4.5`, `图片 4.1`, `图片 4.0`, `图片 3.1`, `图片 3.0`
+- Aspect ratios: `智能`, `21:9`, `16:9`, `3:2`, `4:3`, `1:1`, `3:4`, `2:3`, `9:16`
+- Resolutions: `高清 2K`, `超清 4K`
+
+One image task can produce up to `4` images.
+
+### Video
+
+Optional flags:
+
+- `--model`
+- `--reference-mode`
+- `--duration`
+- `--aspect`
+- `--resolution`
+- `--reference-file`
+- `--first-frame-file`
+- `--last-frame-file`
+- `--submit-retries`
+- `--submit-retry-delay-ms`
+- `--record-id-wait-ms`
+
+Observed video options:
+
+- Models: `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
+- Reference modes: `全能参考`, `首尾帧`, `智能多帧`, `主体参考`
+- Durations: `4s` to `15s`
+- Aspect ratios: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16`
+- Resolutions seen: `720P`, `1080P`
+
+One video task produces `1` MP4.
+
+## Video mode compatibility
+
+Choose the reference mode first, then choose a model that really works for that mode.
+
+Current observed compatibility:
+
+- `全能参考` -> `Seedance 2.0 Fast`, `Seedance 2.0`
+- `首尾帧` -> `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
+- `智能多帧` -> `视频 3.0 Fast`, `视频 3.0`
+- `主体参考` -> `视频 3.0`
+
+The site can silently rewrite unsupported combinations. The script re-checks the final visible selection and fails fast on mismatch.
+
+## Prompt rules
+
+Keep structured choices in flags, not inside the prompt.
+
+Good examples:
+
+- `竖屏` -> `--aspect 9:16`
+- `12 秒视频` -> `--duration 12s`
+- `1080P` -> `--resolution 1080P`
+- `主体参考` -> `--reference-mode 主体参考`
+
+Keep the prompt focused on content:
+
+- subject
+- scene
+- action
+- emotion
+- motion
+- camera language
+- style
+
+## Reference binding rules
+
+Some video modes use JiMeng mention tokens inside the prompt to bind uploaded materials.
+
+- `全能参考`: use `@图片1`, `@图片2`, `@图片3` in upload order
+- `主体参考`: use `@主体`
+- multiple subject images in `主体参考`: use local syntax `@主体1`, `@主体2`
+- `首尾帧`: do not use prompt mentions; use `--first-frame-file` and `--last-frame-file`
+- `智能多帧`: do not rely on prompt mention tokens
+
+Important: plain text like `@图片1` is not enough by itself. The script converts these tokens into real JiMeng mention tags before submit.
+
+## High-traffic Seedance behavior
+
+Hot models such as `Seedance 2.0 Fast` and `Seedance 2.0` can be queue-heavy or temporarily reject new submits.
+
+Recommended retry settings:
 
 ```bash
-# Step 1: Ensure login
-node scripts/jimeng-browser.js login
-
-# Step 2: Generate
-node scripts/jimeng-browser.js generate \
-  --tool image \
-  --prompt "赛博朋克风格的东京街头" \
-  --model "图片5.0 Lite" \
-  --aspect "16:9" \
-  --json true
-# → { "ok": true, "recordId": "abc123", ... }
-
-# Step 3: Poll status
-node scripts/jimeng-browser.js record-status \
-  --record-id abc123 \
-  --json true
-# → { "isComplete": true, "status": "已完成", ... }
-
-# Step 4: Download
-node scripts/jimeng-browser.js download-record \
-  --record-id abc123 \
-  --wait-complete true \
-  --json true
-# → { "ok": true, "fileCount": 4, "files": [...] }
+--submit-retries 2 --submit-retry-delay-ms 60000 --record-id-wait-ms 180000
 ```
 
-## Options Reference
+Possible outcomes:
 
-### Global Flags
+- normal success with `recordId`
+- accepted submit with delayed card creation: `serverAccepted=true` but no `recordId` yet
+- explicit capacity reject from JiMeng
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--json true\|false` | `false` | Emit structured JSON to stdout |
-| `--headless true\|false` | `true` | Run browser in headless mode |
-| `--timeout-ms` | `180000` | General operation timeout (ms) |
-| `--user-data-dir` | `runtime/jimeng-profile/` | Persistent browser profile directory |
-| `--artifacts-dir` | `runtime/artifacts/` | Screenshot and snapshot output directory |
-| `--registry-path` | `runtime/tracked-records.jsonl` | Local task registry file |
+Treat `serverAccepted=true` as accepted, not as a hard failure.
 
-### Generate Flags
+## Status model
 
-| Flag | Applies To | Description |
-|------|-----------|-------------|
-| `--tool image\|video` | Both | Generation type |
-| `--prompt "..."` | Both | Text prompt (required) |
-| `--model` | Both | Model name (e.g. `图片5.0 Lite`, `Seedance 2.0 Fast`) |
-| `--aspect` | Both | Aspect ratio (e.g. `16:9`, `1:1`, `9:16`) |
-| `--resolution` | Both | Resolution (e.g. `高清 2K`, `1080P`) |
-| `--reference-file` | Both | Reference image path(s), comma-separated |
-| `--reference-mode` | Video | `全能参考`, `首尾帧`, `智能多帧`, `主体参考` |
-| `--duration` | Video | `5s` or `10s` |
-| `--first-frame-file` | Video | First frame image for 首尾帧 mode |
-| `--last-frame-file` | Video | Last frame image for 首尾帧 mode |
-| `--submit-retries` | Video | Retry count on submit failure (default: 2 for video) |
-| `--submit-retry-delay-ms` | Video | Delay between retries (default: 60000) |
-| `--record-id-wait-ms` | Video | Max wait for record card to appear (default: 180000) |
-| `--character-id` | Both | Tag for tracking by character/session |
+`record-status` returns structured fields such as:
 
-### Download Flags
+- `status`
+- `isComplete`
+- `isFailed`
+- `isCanceled`
+- `canCancel`
+- `progressPercent`
+- `queuePosition`
+- `queueTotal`
+- `etaText`
+- `failureReason`
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--record-id` | — | Record to download (required) |
-| `--wait-complete` | `true` | Wait for task completion before downloading |
-| `--wait-timeout-ms` | `900000` | Max wait time for completion (15 min) |
-| `--poll-interval-ms` | `15000` | Status check interval while waiting |
-| `--output-dir` | `runtime/artifacts/record-<id>/` | Download output directory |
+Typical coarse states:
 
-## Status Model
+- `queued`
+- `completed`
+- `canceled`
+- `failed`
 
-Map JiMeng task states to these coarse categories:
+Special case:
 
-| Category | JiMeng Status Strings |
-|----------|----------------------|
-| **Queued** | `排队加速中`, `生成中`, `造梦中`, `智能创意中` |
-| **Completed** | `已完成` |
-| **Failed** | Any task with `isFailed=true` |
+- image tasks can be partially successful and partially failed at the same time
 
-Known failure types:
+## Privacy
 
-| Type | Example Message |
-|------|-----------------|
-| Input policy reject | `你输入的文字不符合平台规则，请修改后重试` |
-| Output policy reject | `视频未通过审核，本次不消耗积分` |
-| Capacity limit | `因目前处于使用高峰期，暂时无法提交更多任务...` |
+Do not commit `runtime/`.
 
-## Project Structure
+It may contain:
 
-```
-jimeng-browser-automation/
-├── SKILL.md                      # Skill definition (agent-facing)
-├── package.json                  # Dependencies (playwright)
-├── scripts/
-│   └── jimeng-browser.js         # Browser driver and all commands
-├── agents/
-│   └── openai.yaml               # OpenAI agent interface config
-├── references/
-│   └── jimeng-flow.md            # Site routes, selectors, observed behaviors
-└── runtime/                      # (gitignored) local data
-    ├── jimeng-profile/            # Persistent browser session
-    ├── artifacts/                 # Screenshots, downloads, snapshots
-    └── tracked-records.jsonl      # Local task registry
-```
+- browser profile data
+- login session state
+- QR screenshots
+- generated files
+- local task tracking data
 
-## Notes
+## More detail
 
-- The `runtime/` directory is local-only and gitignored. It contains login sessions and downloaded files.
-- JiMeng updates its UI frequently. When selectors break, run `snapshot` on the affected tool page and update selectors in `scripts/jimeng-browser.js` against `references/jimeng-flow.md`.
-- The script masks Playwright's automation fingerprint (`webdriver` property) to avoid detection.
-- For parallel runs, use separate `--user-data-dir` paths to avoid session conflicts.
+- Agent-facing skill doc: [SKILL.md](./SKILL.md)
+- Site observations and edge cases: [references/jimeng-flow.md](./references/jimeng-flow.md)
+- Main driver: [scripts/jimeng-browser.js](./scripts/jimeng-browser.js)

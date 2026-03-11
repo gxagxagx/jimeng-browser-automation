@@ -1,4 +1,6 @@
 node_modules/
 runtime/
+.claude/
 .DS_Store
 *.log
+runtime-*.png

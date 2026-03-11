@@ -233,7 +233,7 @@ function maybeEmitJson(args, payload) {
 async function launchContext(options) {
   const context = await chromium.launchPersistentContext(options.userDataDir, {
     headless: options.headless,
-    viewport: { width: 1440, height: 1200 },
+    viewport: { width: 1280, height: 720 },
     args: ['--disable-blink-features=AutomationControlled']
   });
   await context.addInitScript(() => {
@@ -258,6 +258,83 @@ async function getBodyText(page, maxLength = 8000) {
 async function pageLooksLoggedOut(page) {
   const loginButton = page.getByText('登录', { exact: true }).first();
   return isVisible(loginButton);
+}
+
+async function openGeneratorFromHome(page, tool) {
+  const label = tool === 'video' ? '视频生成' : tool === 'image' ? '图片生成' : null;
+  if (!label) {
+    return false;
+  }
+
+  const matches = page.getByText(label, { exact: true });
+  const count = await matches.count().catch(() => 0);
+  for (let i = count - 1; i >= 0; i -= 1) {
+    const current = matches.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 24 || box.height < 12) {
+      continue;
+    }
+    if (!(await isVisible(current))) {
+      continue;
+    }
+
+    await current.click({ force: true });
+    await page.waitForTimeout(1200);
+    await safeNetworkIdle(page, 10000);
+    return true;
+  }
+
+  return false;
+}
+
+async function getActiveGeneratorRoot(page) {
+  const buttons = page.locator('button.submit-button-KJTUYS');
+  let best = null;
+  const buttonCount = await buttons.count();
+
+  for (let i = 0; i < buttonCount; i += 1) {
+    const button = buttons.nth(i);
+    if (!(await isVisible(button))) {
+      continue;
+    }
+
+    const box = await button.boundingBox().catch(() => null);
+    if (!box) {
+      continue;
+    }
+
+    const root = button.locator('xpath=ancestor::div[contains(@class,"dimension-layout-FUl4Nj") and contains(@class,"default-layout-bOIxyJ")][1]');
+    if (!(await root.count().catch(() => 0))) {
+      continue;
+    }
+
+    if (!best || box.y > best.y) {
+      best = { root, y: box.y };
+    }
+  }
+
+  if (best) {
+    return best.root;
+  }
+
+  const roots = page.locator('.dimension-layout-FUl4Nj.default-layout-bOIxyJ');
+  let fallback = null;
+  const rootCount = await roots.count();
+  for (let i = 0; i < rootCount; i += 1) {
+    const current = roots.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 120 || box.height < 80) {
+      continue;
+    }
+    if (!(await isVisible(current))) {
+      continue;
+    }
+    if (!fallback || box.y > fallback.y) {
+      fallback = { root: current, y: box.y };
+    }
+  }
+
+  return fallback?.root || null;
 }
 
 async function dismissBindingModal(page) {
@@ -317,6 +394,8 @@ async function collectVisibleElements(page) {
 function inferRecordStatus(text) {
   const normalized = normalizeWhitespace(text);
   const markers = [
+    ['你已取消生成', '已取消'],
+    ['已取消生成', '已取消'],
     ['视频未通过审核', '视频未通过审核'],
     ['未通过审核', '视频未通过审核'],
     ['因目前处于使用高峰期', '高峰期限流'],
@@ -477,6 +556,14 @@ async function waitForGenerateApiResult(page, timeoutMs) {
       const request = candidate.request();
       return request.method() === 'POST' && candidate.url().includes('/mweb/v1/aigc_draft/generate');
     }, { timeout: timeoutMs });
+    const request = response.request();
+    const requestBodyText = request.postData() || null;
+    let requestBody = null;
+    try {
+      requestBody = requestBodyText ? JSON.parse(requestBodyText) : null;
+    } catch {
+      requestBody = null;
+    }
 
     const bodyText = await response.text().catch(() => '');
     let body = null;
@@ -498,6 +585,8 @@ async function waitForGenerateApiResult(page, timeoutMs) {
       taskId: task.task_id || null,
       submitId: task.submit_id || null,
       serverStatus: aigcData.status ?? task.status ?? null,
+      requestBody,
+      requestBodyText,
       body
     };
   } catch {
@@ -777,6 +866,38 @@ async function fetchHistoryEntry(page, recordId) {
   return data?.[recordId] || null;
 }
 
+async function cancelGenerateByHistoryId(page, historyId) {
+  const response = await page.evaluate(async (targetHistoryId) => {
+    const request = await fetch('/mweb/v1/aigc_draft/cancel_generate', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ history_id: String(targetHistoryId) }),
+      credentials: 'include'
+    });
+
+    return {
+      status: request.status,
+      text: await request.text()
+    };
+  }, String(historyId));
+
+  let body = null;
+  try {
+    body = JSON.parse(response.text);
+  } catch {
+    body = null;
+  }
+
+  return {
+    httpStatus: response.status,
+    ret: body?.ret ?? null,
+    errmsg: body?.errmsg ?? null,
+    logid: body?.logid ?? body?.log_id ?? null,
+    accepted: response.status === 200 && String(body?.ret) === '0',
+    body
+  };
+}
+
 function inferToolFromHistoryEntry(entry) {
   if (!entry) {
     return null;
@@ -869,6 +990,63 @@ function extractHistoryEntryFiles(entry, tool) {
   return extractHistoryEntryImageFiles(entry);
 }
 
+function extractFailedImageCountFromText(text) {
+  const normalized = normalizeWhitespace(text || '');
+  const matches = normalized.match(/图片生成失败/g);
+  return matches ? matches.length : 0;
+}
+
+function recordHasFinalActionText(record) {
+  const normalized = normalizeWhitespace(record?.text || '');
+  return ['重新编辑', '再次生成', '下载'].some((marker) => normalized.includes(marker));
+}
+
+function summarizeImageResultCounts(record, historyEntry) {
+  const historyFinishedCount = Number.isFinite(Number(historyEntry?.finished_image_count))
+    ? Number(historyEntry.finished_image_count)
+    : null;
+  const historyTotalCount = Number.isFinite(Number(historyEntry?.total_image_count))
+    ? Number(historyEntry.total_image_count)
+    : null;
+  const historyFileCount = historyEntry ? extractHistoryEntryImageFiles(historyEntry).length : null;
+  const historyFailedCount = Array.isArray(historyEntry?.failed_item_list)
+    ? historyEntry.failed_item_list.length
+    : null;
+  const recordThumbnailCount = Array.isArray(record?.thumbnails) ? record.thumbnails.length : null;
+  const failedFromText = extractFailedImageCountFromText(record?.text || '');
+
+  let successfulCount = historyFileCount ?? recordThumbnailCount ?? historyFinishedCount;
+  let expectedCount = historyTotalCount;
+  if (expectedCount === null && successfulCount !== null && historyFailedCount !== null) {
+    expectedCount = successfulCount + historyFailedCount;
+  }
+  if (expectedCount === null && successfulCount !== null && failedFromText > 0) {
+    expectedCount = successfulCount + failedFromText;
+  }
+  if (expectedCount === null && successfulCount !== null && record?.status === '已完成') {
+    expectedCount = successfulCount;
+  }
+
+  let failedCount = historyFailedCount;
+  if (failedCount === null && expectedCount !== null && successfulCount !== null) {
+    failedCount = Math.max(expectedCount - successfulCount, 0);
+  } else if (failedCount === null && failedFromText > 0) {
+    failedCount = failedFromText;
+  }
+
+  if (successfulCount === null && expectedCount !== null && failedCount !== null) {
+    successfulCount = Math.max(expectedCount - failedCount, 0);
+  }
+
+  const partialFailure = (successfulCount ?? 0) > 0 && (failedCount ?? 0) > 0;
+  return {
+    successfulCount,
+    expectedCount,
+    failedCount,
+    partialFailure
+  };
+}
+
 function historyEntryFailureMessage(entry) {
   if (!entry) {
     return null;
@@ -901,13 +1079,23 @@ function historyEntryStatusLabel(entry) {
     return null;
   }
 
+  const canceledMessage = normalizeWhitespace(entry?.fail_starling_message || '');
+  const status = Number(entry?.task?.status ?? entry?.status);
+  if (status === 30 && (canceledMessage.includes('你已取消生成') || canceledMessage.includes('已取消生成'))) {
+    return '已取消';
+  }
+
   const failure = historyEntryFailureMessage(entry);
   if (failure) {
     return failure;
   }
 
-  const status = Number(entry?.task?.status ?? entry?.status);
   if (status === 50) {
+    const resolvedTool = inferToolFromHistoryEntry(entry);
+    const imageCounts = summarizeImageResultCounts(null, entry);
+    if (resolvedTool === 'image' && imageCounts.partialFailure) {
+      return '部分生成失败';
+    }
     return '已完成';
   }
   if (status === 20) {
@@ -932,7 +1120,7 @@ function historyEntryIsComplete(entry, tool) {
     return files.length >= 1;
   }
 
-  return files.length >= 4;
+  return files.length >= 1;
 }
 
 function extractHistoryEntryPrompt(entry) {
@@ -996,6 +1184,17 @@ function classifyHistoryFailure(entry) {
   }
 
   if (
+    message.includes('你已取消生成')
+    || message.includes('已取消生成')
+  ) {
+    return {
+      failureType: 'user-canceled',
+      failurePhase: 'user-action',
+      failureReason: message || '你已取消生成，积分已返还'
+    };
+  }
+
+  if (
     key === 'ErrMessage_APP_OutputVideoRisk'
     || message.includes('视频未通过审核')
     || message.includes('生成的视频未通过审核')
@@ -1043,21 +1242,34 @@ function summarizeRecordStatus(recordId, tool, record, historyEntry) {
   const historyStatus = historyEntryStatusLabel(historyEntry);
   const failure = classifyHistoryFailure(historyEntry);
   const historyQueue = historyEntry?.queue_info || {};
-  const finishedCount = Number.isFinite(Number(historyEntry?.finished_image_count))
-    ? Number(historyEntry.finished_image_count)
-    : null;
-  const totalCount = Number.isFinite(Number(historyEntry?.total_image_count))
-    ? Number(historyEntry.total_image_count)
-    : null;
+  const imageCounts = tool === 'image' ? summarizeImageResultCounts(record, historyEntry) : null;
+  const finishedCount = imageCounts?.successfulCount ?? (
+    Number.isFinite(Number(historyEntry?.finished_image_count))
+      ? Number(historyEntry.finished_image_count)
+      : null
+  );
+  const totalCount = imageCounts?.expectedCount ?? (
+    Number.isFinite(Number(historyEntry?.total_image_count))
+      ? Number(historyEntry.total_image_count)
+      : null
+  );
+  const failedCount = imageCounts?.failedCount ?? null;
+  const canceled = failure.failureType === 'user-canceled' || domStatus === '已取消';
 
   let status = historyStatus || domStatus || null;
+  if (canceled) {
+    status = '已取消';
+  }
   if (!status && failure.failureReason) {
     status = failure.failureReason;
+  }
+  if (imageCounts?.partialFailure) {
+    status = '部分生成失败';
   }
   if (domStatus && ['排队加速中', '造梦中', '智能创意中', '生成中'].includes(domStatus)) {
     status = domStatus;
   }
-  if (domStatus === '已完成') {
+  if (domStatus === '已完成' && !imageCounts?.partialFailure && !canceled) {
     status = '已完成';
   }
 
@@ -1069,8 +1281,12 @@ function summarizeRecordStatus(recordId, tool, record, historyEntry) {
   const queuePosition = domQueue.queuePosition ?? (Number.isFinite(Number(historyQueue.queue_idx)) ? Number(historyQueue.queue_idx) : null);
   const queueTotal = domQueue.queueTotal ?? (Number.isFinite(Number(historyQueue.queue_length)) ? Number(historyQueue.queue_length) : null);
   const etaText = domQueue.etaText || null;
-  const complete = recordIsComplete(record, tool) || historyEntryIsComplete(historyEntry, tool);
-  const failed = Boolean(failure.failureReason) || (record ? isFailureStatus(record.status) : false);
+  const complete = canceled ? false : (recordIsComplete(record, tool) || historyEntryIsComplete(historyEntry, tool));
+  const failed = canceled
+    ? false
+    : (Boolean(failure.failureReason) || Boolean(imageCounts?.partialFailure) || (record ? isFailureStatus(record.status) : false));
+  const numericStatus = Number(historyEntry?.status ?? historyEntry?.task?.status);
+  const canCancel = tool === 'video' && !complete && !failed && !canceled && numericStatus === 20;
 
   return {
     ok: true,
@@ -1081,6 +1297,8 @@ function summarizeRecordStatus(recordId, tool, record, historyEntry) {
     status,
     isComplete: complete,
     isFailed: failed,
+    isCanceled: canceled,
+    canCancel,
     progressPercent,
     queuePosition,
     queueTotal,
@@ -1091,6 +1309,8 @@ function summarizeRecordStatus(recordId, tool, record, historyEntry) {
     taskStatusCode: Number.isFinite(Number(historyEntry?.task?.status)) ? Number(historyEntry.task.status) : null,
     finishedCount,
     totalCount,
+    failedCount,
+    partialFailure: Boolean(imageCounts?.partialFailure),
     auditFailureType: failure.failureType,
     auditFailurePhase: failure.failurePhase,
     failureReason: failure.failureReason,
@@ -1171,15 +1391,20 @@ function isFailureStatus(status) {
 }
 
 function recordIsComplete(record, tool) {
-  if (!record || record.status !== '已完成') {
+  if (!record) {
     return false;
   }
 
   if (tool === 'video') {
-    return record.videos.length >= 1;
+    return record.status === '已完成' && record.videos.length >= 1;
   }
 
-  return record.thumbnails.length >= 4;
+  const imageCounts = summarizeImageResultCounts(record, null);
+  if (record.status === '已完成') {
+    return (imageCounts.successfulCount ?? 0) >= 1;
+  }
+
+  return Boolean(imageCounts.partialFailure && recordHasFinalActionText(record));
 }
 
 async function locateRecordWithStatus(page, recordId) {
@@ -1189,9 +1414,12 @@ async function locateRecordWithStatus(page, recordId) {
   }
 
   const text = normalizeWhitespace(await locator.innerText().catch(() => ''));
-  const status = inferRecordStatus(text);
   const thumbnails = await collectRecordResultThumbnails(locator);
   const videos = await collectRecordVideoSources(locator);
+  let status = inferRecordStatus(text);
+  if (status === '生成失败' && thumbnails.length >= 1 && extractFailedImageCountFromText(text) > 0 && recordHasFinalActionText({ text })) {
+    status = '部分生成失败';
+  }
   return {
     locator,
     text,
@@ -1217,12 +1445,16 @@ async function waitForRecordCompletion(page, recordId, tool, timeoutMs, pollInte
         tool: resolvedTool
       };
     }
+    const historyFailure = classifyHistoryFailure(historyEntry);
+    if (historyFailure.failureType === 'user-canceled') {
+      throw new Error(`Record ${recordId} was canceled: ${historyFailure.failureReason || '你已取消生成，积分已返还'}`);
+    }
     if (record && isFailureStatus(record.status)) {
       throw new Error(`Record ${recordId} failed: ${truncateText(record.text, 200)}`);
     }
-    const historyFailure = historyEntryFailureMessage(historyEntry);
-    if (historyFailure) {
-      throw new Error(`Record ${recordId} failed: ${historyFailure}`);
+    const historyFailureMessageText = historyEntryFailureMessage(historyEntry);
+    if (historyFailureMessageText) {
+      throw new Error(`Record ${recordId} failed: ${historyFailureMessageText}`);
     }
 
     await page.waitForTimeout(pollIntervalMs);
@@ -1235,6 +1467,43 @@ async function waitForRecordCompletion(page, recordId, tool, timeoutMs, pollInte
     record: null,
     historyEntry: null,
     tool: resolvedTool
+  };
+}
+
+async function waitForRecordCanceled(page, recordId, tool, timeoutMs, pollIntervalMs) {
+  const started = Date.now();
+  let resolvedTool = tool;
+
+  while (Date.now() - started < timeoutMs) {
+    const record = await locateRecordWithStatus(page, recordId).catch(() => null);
+    const historyEntry = await fetchHistoryEntry(page, recordId).catch(() => null);
+    resolvedTool = inferToolFromHistoryEntry(historyEntry) || resolvedTool;
+    const summary = summarizeRecordStatus(recordId, resolvedTool, record, historyEntry);
+
+    if (summary.isCanceled) {
+      return {
+        record,
+        historyEntry,
+        tool: resolvedTool,
+        summary
+      };
+    }
+
+    if (summary.isComplete) {
+      throw new Error(`Record ${recordId} completed before cancellation finished.`);
+    }
+    if (summary.isFailed && !summary.isCanceled) {
+      throw new Error(`Record ${recordId} failed before cancellation finished: ${summary.failureReason || summary.status || 'unknown failure'}`);
+    }
+
+    await page.waitForTimeout(pollIntervalMs);
+  }
+
+  return {
+    record: null,
+    historyEntry: null,
+    tool: resolvedTool,
+    summary: null
   };
 }
 
@@ -1383,51 +1652,85 @@ async function navigateToTool(page, tool) {
   const url = TOOL_URLS[resolvedTool] || TOOL_URLS.home;
   await gotoAndSettle(page, url);
   await dismissBindingModal(page);
+  if (['image', 'video'].includes(resolvedTool) && page.url().includes('/ai-tool/home')) {
+    const opened = await openGeneratorFromHome(page, resolvedTool);
+    if (opened) {
+      await dismissBindingModal(page);
+    }
+  }
   return page;
 }
 
-async function findPromptTarget(page) {
-  const directTextareas = [
-    page.locator('textarea[placeholder*="请描述你想生成的图片"]'),
-    page.locator('textarea[placeholder*="描述你想如何调整图片"]'),
-    page.locator('textarea[placeholder*="输入文字，描述你想创作的画面内容"]'),
-    page.locator('textarea.prompt-textarea-l5tJNE')
-  ];
+async function findPromptTarget(page, options = {}) {
+  const preferRichEditor = Boolean(options.preferRichEditor);
+  const scope = options.scope || await getActiveGeneratorRoot(page).catch(() => null) || page;
 
-  for (const locator of directTextareas) {
-    const count = await locator.count();
-    for (let i = 0; i < count; i += 1) {
-      const current = locator.nth(i);
+  const findTextareaTarget = async () => {
+    const directTextareas = [
+      scope.locator('textarea[placeholder*="请描述你想生成的图片"]'),
+      scope.locator('textarea[placeholder*="描述你想如何调整图片"]'),
+      scope.locator('textarea[placeholder*="输入文字，描述你想创作的画面内容"]'),
+      scope.locator('textarea.prompt-textarea-l5tJNE')
+    ];
+
+    for (const locator of directTextareas) {
+      const count = await locator.count();
+      for (let i = 0; i < count; i += 1) {
+        const current = locator.nth(i);
+        if (await isVisible(current)) {
+          return { type: 'textarea', locator: current };
+        }
+      }
+    }
+
+    const textarea = scope.locator('textarea');
+    const textareaCount = await textarea.count();
+    for (let i = 0; i < textareaCount; i += 1) {
+      const current = textarea.nth(i);
+      const placeholder = await current.getAttribute('placeholder').catch(() => null);
+      if (placeholder && placeholder.includes('搜索')) {
+        continue;
+      }
       if (await isVisible(current)) {
         return { type: 'textarea', locator: current };
       }
     }
+
+    return null;
+  };
+
+  const findEditorTarget = async () => {
+    const editors = scope.locator('[contenteditable="true"]');
+    const editorCount = await editors.count();
+    for (let i = editorCount - 1; i >= 0; i -= 1) {
+      const current = editors.nth(i);
+      const box = await current.boundingBox().catch(() => null);
+      if (box && box.width > 120 && box.height > 16) {
+        return { type: 'editor', locator: current };
+      }
+    }
+
+    return null;
+  };
+
+  if (preferRichEditor) {
+    const editorTarget = await findEditorTarget();
+    if (editorTarget) {
+      return editorTarget;
+    }
   }
 
-  const textarea = page.locator('textarea');
-  const textareaCount = await textarea.count();
-  for (let i = 0; i < textareaCount; i += 1) {
-    const current = textarea.nth(i);
-    const placeholder = await current.getAttribute('placeholder').catch(() => null);
-    if (placeholder && placeholder.includes('搜索')) {
-      continue;
-    }
-    if (await isVisible(current)) {
-      return { type: 'textarea', locator: current };
-    }
+  const textareaTarget = await findTextareaTarget();
+  if (textareaTarget) {
+    return textareaTarget;
   }
 
-  const editors = page.locator('[contenteditable="true"]');
-  const editorCount = await editors.count();
-  for (let i = 0; i < editorCount; i += 1) {
-    const current = editors.nth(i);
-    const box = await current.boundingBox().catch(() => null);
-    if (box && box.width > 120 && box.height > 32) {
-      return { type: 'editor', locator: current };
-    }
+  const editorTarget = await findEditorTarget();
+  if (editorTarget) {
+    return editorTarget;
   }
 
-  const inputs = page.locator('input[type="text"], input:not([type])');
+  const inputs = scope.locator('input[type="text"], input:not([type])');
   const inputCount = await inputs.count();
   for (let i = 0; i < inputCount; i += 1) {
     const current = inputs.nth(i);
@@ -1443,15 +1746,129 @@ async function findPromptTarget(page) {
   return null;
 }
 
-async function fillPrompt(target, prompt) {
+function tokenizeReferencePrompt(prompt) {
+  const tokens = [];
+  const pattern = /@主体\d*|@(图片|视频|音频)\d+/g;
+  let lastIndex = 0;
+
+  for (const match of String(prompt).matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > lastIndex) {
+      tokens.push({ type: 'text', value: prompt.slice(lastIndex, index) });
+    }
+    tokens.push({ type: 'mention', label: match[0].slice(1) });
+    lastIndex = index + match[0].length;
+  }
+
+  if (lastIndex < String(prompt).length) {
+    tokens.push({ type: 'text', value: prompt.slice(lastIndex) });
+  }
+
+  return tokens.length ? tokens : [{ type: 'text', value: String(prompt) }];
+}
+
+async function editorIsEffectivelyEmpty(locator) {
+  return locator.evaluate((node) => {
+    const text = (node.innerText || '').trim();
+    return Boolean(node.querySelector('.is-editor-empty')) || !text;
+  }).catch(() => false);
+}
+
+async function clearEditor(locator) {
+  const page = locator.page();
+  await locator.click({ force: true });
+  await locator.evaluate((node) => {
+    node.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }).catch(() => null);
+  await page.keyboard.press('Backspace').catch(() => null);
+  await page.waitForTimeout(150);
+}
+
+async function insertTextIntoEditor(page, text) {
+  if (!text) {
+    return;
+  }
+
+  await page.keyboard.insertText(text);
+}
+
+async function insertReferenceMention(page, label) {
+  const mention = String(label || '').trim();
+  const subjectMatch = mention.match(/^主体(\d+)?$/);
+  const targetText = subjectMatch ? '主体' : mention;
+  const targetOccurrence = subjectMatch && subjectMatch[1]
+    ? Math.max(1, Number.parseInt(subjectMatch[1], 10) || 1)
+    : 1;
+  let available = [];
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await page.keyboard.type('@');
+    await page.waitForTimeout(1500);
+
+    const options = page.locator('.lv-select-option');
+    const optionCount = await options.count().catch(() => 0);
+    const matchingOptions = [];
+    available = [];
+
+    for (let i = 0; i < optionCount; i += 1) {
+      const current = options.nth(i);
+      if (!(await isVisible(current))) {
+        continue;
+      }
+      const text = (await current.innerText().catch(() => '')).trim();
+      if (!text) {
+        continue;
+      }
+      available.push(text);
+      if (text === targetText) {
+        matchingOptions.push(current);
+      }
+    }
+
+    const targetOption = matchingOptions[targetOccurrence - 1] || null;
+    if (targetOption) {
+      await targetOption.click({ force: true });
+      await page.waitForTimeout(200);
+      return;
+    }
+
+    await page.keyboard.press('Backspace').catch(() => null);
+    await page.waitForTimeout(800);
+  }
+
+  throw new Error(`Could not find reference mention option: ${label}. Available: ${available.join(', ') || 'none'}`);
+}
+
+async function fillEditorPrompt(locator, prompt, options = {}) {
+  const enableReferenceMentions = Boolean(options.enableReferenceMentions);
+  const page = locator.page();
+  if (!(await editorIsEffectivelyEmpty(locator))) {
+    await clearEditor(locator);
+  } else {
+    await locator.click({ force: true });
+  }
+
+  const tokens = enableReferenceMentions
+    ? tokenizeReferencePrompt(prompt)
+    : [{ type: 'text', value: String(prompt) }];
+
+  for (const token of tokens) {
+    if (token.type === 'mention') {
+      await insertReferenceMention(page, token.label);
+      continue;
+    }
+    await insertTextIntoEditor(page, token.value);
+  }
+}
+
+async function fillPrompt(target, prompt, options = {}) {
   if (target.type === 'editor') {
-    await target.locator.click();
-    await target.locator.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => null);
-    await target.locator.fill(prompt).catch(async () => {
-      await target.locator.evaluate((node, value) => {
-        node.textContent = value;
-      }, prompt);
-    });
+    await fillEditorPrompt(target.locator, prompt, options);
     return;
   }
 
@@ -1464,7 +1881,8 @@ async function maybeUploadImage(page, imagePath) {
     return false;
   }
 
-  const fileInputs = page.locator('input[type="file"]');
+  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  const fileInputs = scope.locator('input[type="file"]');
   const count = await fileInputs.count();
   for (let i = 0; i < count; i += 1) {
     const current = fileInputs.nth(i);
@@ -1489,7 +1907,8 @@ async function maybeUploadVideoReferences(page, args) {
   const genericFiles = parseFileList(args['reference-file'] || args['image-file']);
   const firstFrameFiles = parseFileList(args['first-frame-file']);
   const lastFrameFiles = parseFileList(args['last-frame-file']);
-  const fileInputs = page.locator('input[type="file"]');
+  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  const fileInputs = scope.locator('input[type="file"]');
   const count = await fileInputs.count();
 
   if (!count) {
@@ -1497,7 +1916,7 @@ async function maybeUploadVideoReferences(page, args) {
   }
 
   if (firstFrameFiles.length || lastFrameFiles.length) {
-    const referenceGroups = page.locator('.references-vWIzeo .reference-group-_DAGw1');
+    const referenceGroups = scope.locator('.references-vWIzeo .reference-group-_DAGw1');
     if (firstFrameFiles.length) {
       await setFileInputFiles(referenceGroups.nth(0).locator('input[type="file"]').first(), firstFrameFiles);
     }
@@ -1522,7 +1941,7 @@ async function maybeUploadVideoReferences(page, args) {
     }
 
     if (inputDetails.every((detail) => !detail.multiple)) {
-      const referenceGroups = page.locator('.references-vWIzeo .reference-group-_DAGw1');
+      const referenceGroups = scope.locator('.references-vWIzeo .reference-group-_DAGw1');
       await setFileInputFiles(referenceGroups.nth(0).locator('input[type="file"]').first(), [genericFiles[0]]);
       if (genericFiles[1]) {
         await setFileInputFiles(referenceGroups.nth(1).locator('input[type="file"]').first(), [genericFiles[1]]);
@@ -1544,8 +1963,23 @@ async function maybeUploadVideoReferences(page, args) {
   return false;
 }
 
+async function waitForVideoReferenceEditorReady(page, timeoutMs = 10000) {
+  const started = Date.now();
+  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  while (Date.now() - started < timeoutMs) {
+    const miniUpload = await scope.locator('.reference-upload-h7tmnr.mini-XAjjpa').count().catch(() => 0);
+    const promptEditors = await scope.locator('[contenteditable="true"]').count().catch(() => 0);
+    if (miniUpload > 0 && promptEditors > 0) {
+      return true;
+    }
+    await page.waitForTimeout(400);
+  }
+  return false;
+}
+
 async function findSubmitButton(page) {
-  const directButtons = page.locator('button.submit-button-KJTUYS');
+  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  const directButtons = scope.locator('button.submit-button-KJTUYS');
   const directCount = await directButtons.count();
   for (let i = 0; i < directCount; i += 1) {
     const locator = directButtons.nth(i);
@@ -1559,13 +1993,13 @@ async function findSubmitButton(page) {
   }
 
   for (const label of SUBMIT_LABELS) {
-    const locator = page.getByText(label, { exact: true }).first();
+    const locator = scope.getByText(label, { exact: true }).first();
     if (await isVisible(locator)) {
       return { label, locator };
     }
   }
 
-  const allButtons = page.locator('button, [role="button"], a');
+  const allButtons = scope.locator('button, [role="button"], a');
   const count = Math.min(await allButtons.count(), 80);
   for (let i = 0; i < count; i += 1) {
     const current = allButtons.nth(i);
@@ -1589,22 +2023,98 @@ async function chooseSelectOption(page, selectIndex, optionText) {
     return false;
   }
 
-  const select = page.locator('.lv-select[role="combobox"]').nth(selectIndex);
-  if (!(await isVisible(select))) {
+  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  const selects = scope.locator('.lv-select[role="combobox"]');
+  const visibleSelects = [];
+  const selectCount = await selects.count();
+  for (let i = 0; i < selectCount; i += 1) {
+    const current = selects.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 20 || box.height < 12) {
+      continue;
+    }
+    if (!(await isVisible(current))) {
+      continue;
+    }
+    visibleSelects.push(current);
+  }
+
+  const select = visibleSelects[selectIndex];
+  if (!select) {
     throw new Error(`Could not find select index ${selectIndex} for option ${optionText}.`);
   }
 
   await select.click({ force: true });
   await page.waitForTimeout(400);
 
-  const option = page.locator('.lv-select-popup [role="option"]').filter({ hasText: optionText }).first();
-  if (!(await isVisible(option))) {
+  const popupOptions = page.locator('.lv-select-popup [role="option"]');
+  const optionCount = await popupOptions.count();
+  let option = null;
+  for (let i = 0; i < optionCount; i += 1) {
+    const current = popupOptions.nth(i);
+    const text = (await current.innerText().catch(() => '')).trim();
+    const firstLine = text.split('\n')[0].trim();
+    if (text === optionText || firstLine === optionText) {
+      option = current;
+      break;
+    }
+  }
+
+  if (!option || !(await isVisible(option))) {
     throw new Error(`Could not find select option: ${optionText}`);
   }
 
   await option.click({ force: true });
   await page.waitForTimeout(500);
   return true;
+}
+
+async function getVisibleComboboxTexts(page) {
+  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  const combos = scope.locator('[role="combobox"]');
+  const values = [];
+  const count = await combos.count();
+
+  for (let i = 0; i < count; i += 1) {
+    const current = combos.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 20 || box.height < 12) {
+      continue;
+    }
+    if (!(await isVisible(current))) {
+      continue;
+    }
+    values.push((await current.innerText().catch(() => '')).trim());
+  }
+
+  return values;
+}
+
+async function verifyVideoOptionSelections(page, args) {
+  const values = await getVisibleComboboxTexts(page);
+  const actual = {
+    tool: values[0] || null,
+    model: values[1] || null,
+    referenceMode: values[2] || null,
+    duration: values[3] || null
+  };
+
+  const mismatches = [];
+  if (args.model && actual.model !== args.model) {
+    mismatches.push(`model requested=${args.model} actual=${actual.model || '-'}`);
+  }
+  if (args['reference-mode'] && actual.referenceMode !== args['reference-mode']) {
+    mismatches.push(`reference-mode requested=${args['reference-mode']} actual=${actual.referenceMode || '-'}`);
+  }
+  if (args.duration && actual.duration !== args.duration) {
+    mismatches.push(`duration requested=${args.duration} actual=${actual.duration || '-'}`);
+  }
+
+  if (mismatches.length) {
+    throw new Error(`JiMeng changed the requested video options after selection: ${mismatches.join('; ')}`);
+  }
+
+  return actual;
 }
 
 async function chooseToolbarOption(page, groupRole, optionText) {
@@ -1638,7 +2148,8 @@ async function configureAspectResolution(page, args, labelPrefix) {
     return;
   }
 
-  const toolbarButton = page.locator('button.toolbar-button-FhFnQ_').first();
+  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  const toolbarButton = scope.locator('button.toolbar-button-FhFnQ_').first();
   if (!(await isVisible(toolbarButton))) {
     throw new Error(`Could not find the ${labelPrefix} aspect/resolution toolbar button.`);
   }
@@ -1685,6 +2196,7 @@ async function configureVideoOptions(page, args) {
   }
 
   await configureAspectResolution(page, args, 'video');
+  await verifyVideoOptionSelections(page, args);
 }
 
 function createTrackedRecordEntry(args, tool, prompt, recordCard) {
@@ -1840,20 +2352,51 @@ async function commandGenerate(args) {
       await configureVideoOptions(page, args);
     }
 
-    let promptTarget = await findPromptTarget(page);
+    const genericReferenceInput = args['reference-file'] || args['image-file'];
+    const promptHasReferenceMentions = /@主体\d*|@(图片|视频|音频)\d+/.test(prompt);
+    const uploadRequested = tool === 'video'
+      ? Boolean(genericReferenceInput || args['first-frame-file'] || args['last-frame-file'])
+      : Boolean(genericReferenceInput);
+    const uploadBeforePrompt = tool === 'video'
+      && Boolean(genericReferenceInput)
+      && promptHasReferenceMentions;
+    const needsReferenceMentions = uploadBeforePrompt;
+    let uploadWorked = false;
+
+    if (uploadBeforePrompt) {
+      uploadWorked = await maybeUploadVideoReferences(page, args);
+      if (needsReferenceMentions && !uploadWorked) {
+        throw new Error('Could not upload the video reference files before inserting @ mentions.');
+      }
+      if (uploadWorked) {
+        await waitForVideoReferenceEditorReady(page, 10000);
+      }
+      if (uploadWorked && needsReferenceMentions) {
+        await page.waitForTimeout(5000);
+      }
+    }
+
+    const activeScope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+    let promptTarget = await findPromptTarget(page, { preferRichEditor: uploadBeforePrompt, scope: activeScope });
     if (!promptTarget) {
       const snapshot = await saveSnapshot(page, options.artifactsDir, `generate-missing-prompt-${tool}`);
       throw new Error(`Could not find a visible prompt field. Inspect ${snapshot.jsonPath}`);
     }
+    if (needsReferenceMentions && promptTarget.type !== 'editor') {
+      const snapshot = await saveSnapshot(page, options.artifactsDir, `generate-missing-mention-editor-${tool}`);
+      throw new Error(`Could not find the video rich-text editor needed for @ mentions. Inspect ${snapshot.jsonPath}`);
+    }
 
-    await fillPrompt(promptTarget, prompt);
-    const genericReferenceInput = args['reference-file'] || args['image-file'];
-    const uploadRequested = tool === 'video'
-      ? Boolean(genericReferenceInput || args['first-frame-file'] || args['last-frame-file'])
-      : Boolean(genericReferenceInput);
-    const uploadWorked = tool === 'video'
-      ? await maybeUploadVideoReferences(page, args)
-      : await maybeUploadImage(page, genericReferenceInput);
+    await fillPrompt(promptTarget, prompt, {
+      enableReferenceMentions: needsReferenceMentions
+    });
+
+    if (!uploadBeforePrompt) {
+      uploadWorked = tool === 'video'
+        ? await maybeUploadVideoReferences(page, args)
+        : await maybeUploadImage(page, genericReferenceInput);
+    }
+
     if (uploadRequested) {
       const uploadLabel = tool === 'video'
         ? 'Uploaded the video reference file(s).'
@@ -1874,6 +2417,7 @@ async function commandGenerate(args) {
     let pendingMarker = null;
     let attemptCount = 0;
     let generateApiResult = null;
+    let submitRequestPath = null;
 
     for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
       attemptCount = attempt + 1;
@@ -1888,6 +2432,10 @@ async function commandGenerate(args) {
       const generateApiPromise = waitForGenerateApiResult(page, Math.min(options.timeoutMs, 30000));
       await submitButton.locator.click();
       generateApiResult = await generateApiPromise;
+      if (!submitRequestPath && generateApiResult?.requestBody) {
+        submitRequestPath = artifactPath(options.artifactsDir, `generate-submit-request-${tool}`, 'json');
+        fs.writeFileSync(submitRequestPath, JSON.stringify(generateApiResult.requestBody, null, 2));
+      }
 
       if (generateApiResult && !generateApiResult.accepted) {
         const serverMessage = `Server rejected submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
@@ -1978,7 +2526,8 @@ async function commandGenerate(args) {
       serverRet: generateApiResult?.ret ?? null,
       serverErrmsg: generateApiResult?.errmsg ?? null,
       serverHttpStatus: generateApiResult?.httpStatus ?? null,
-      serverStatus: generateApiResult?.serverStatus ?? null
+      serverStatus: generateApiResult?.serverStatus ?? null,
+      submitRequestPath
     };
 
     if (trackedRecord) {
@@ -2125,6 +2674,131 @@ async function commandRecordStatus(args) {
   }
 }
 
+async function commandCancelRecord(args) {
+  const options = parseCommonOptions(args);
+  const trackedEntry = selectTrackedEntry(loadRegistryEntries(options.registryPath), args);
+
+  if (!trackedEntry && !args['record-id']) {
+    throw new Error('The cancel-record command requires --record-id or --character-id.');
+  }
+
+  const target = trackedEntry || {
+    recordId: args['record-id'],
+    tool: args.tool || null,
+    characterId: args['character-id'] || null,
+    createdAt: null,
+    prompt: null,
+    status: null,
+    historyRecordId: null
+  };
+
+  if (!target.recordId) {
+    throw new Error('Could not resolve a record id to cancel.');
+  }
+
+  const waitCanceled = boolFlag(args['wait-canceled'], true);
+  const pollIntervalMs = integerFlag(args['poll-interval-ms'], 2000);
+  const waitTimeoutMs = integerFlag(args['wait-timeout-ms'], 60000);
+
+  logStep(
+    [
+      `Canceling recordId=${target.recordId}`,
+      `tool=${target.tool || args.tool || 'auto'}`,
+      `characterId=${target.characterId || '-'}`,
+      `waitCanceled=${waitCanceled}`
+    ].join(' ')
+  );
+
+  const context = await launchContext(options);
+
+  try {
+    const page = await getMainPage(context);
+    const toolCandidates = buildToolCandidates(target.tool || args.tool || null);
+    const located = await locateRecordAcrossTools(page, target.recordId, toolCandidates);
+    const historyEntry = await fetchHistoryEntry(page, target.recordId).catch(() => null);
+    const tool = inferToolFromHistoryEntry(historyEntry) || located.tool;
+
+    if (tool !== 'video') {
+      throw new Error(`The cancel-record command currently supports video tasks only. Resolved tool: ${tool || 'unknown'}`);
+    }
+
+    if (!historyEntry) {
+      const snapshot = await saveSnapshot(page, options.artifactsDir, `cancel-record-${safeSlug(target.recordId)}`);
+      throw new Error(`Could not load history details for ${target.recordId}. Inspect ${snapshot.jsonPath}`);
+    }
+
+    const beforeSummary = summarizeRecordStatus(target.recordId, tool, located.record, historyEntry);
+    if (beforeSummary.isCanceled) {
+      logStep(`recordId=${target.recordId} is already canceled.`);
+      maybeEmitJson(args, {
+        ok: true,
+        command: 'cancel-record',
+        recordId: target.recordId,
+        tool,
+        historyRecordId: beforeSummary.historyRecordId,
+        alreadyCanceled: true,
+        cancelAccepted: false,
+        before: beforeSummary,
+        after: beforeSummary
+      });
+      return;
+    }
+
+    if (beforeSummary.isComplete) {
+      throw new Error(`Record ${target.recordId} is already complete and cannot be canceled.`);
+    }
+
+    if (beforeSummary.isFailed && !beforeSummary.isCanceled) {
+      throw new Error(`Record ${target.recordId} is already failed and cannot be canceled: ${beforeSummary.failureReason || beforeSummary.status || 'unknown failure'}`);
+    }
+
+    const historyId = historyEntry.history_record_id || historyEntry.task?.history_id || target.historyRecordId || null;
+    if (!historyId) {
+      throw new Error(`Could not resolve history_id for ${target.recordId}; cancel_generate requires history_id.`);
+    }
+
+    const cancelResult = await cancelGenerateByHistoryId(page, historyId);
+    if (!cancelResult.accepted) {
+      throw new Error(`Cancel request failed http=${cancelResult.httpStatus} ret=${cancelResult.ret ?? '-'} errmsg=${cancelResult.errmsg || '-'}`);
+    }
+
+    logStep(`Cancel request accepted for historyId=${historyId}.`);
+
+    let afterSummary = null;
+    if (waitCanceled) {
+      const waited = await waitForRecordCanceled(page, target.recordId, tool, waitTimeoutMs, pollIntervalMs);
+      afterSummary = waited.summary || summarizeRecordStatus(target.recordId, tool, waited.record, waited.historyEntry);
+      if (!afterSummary?.isCanceled) {
+        throw new Error(`Cancel request was accepted, but ${target.recordId} did not reach the canceled state before timeout.`);
+      }
+      logStep(`recordId=${target.recordId} is now canceled.`);
+    } else {
+      const refreshedHistory = await fetchHistoryEntry(page, target.recordId).catch(() => historyEntry);
+      afterSummary = summarizeRecordStatus(target.recordId, tool, located.record, refreshedHistory);
+    }
+
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'cancel-record',
+      recordId: target.recordId,
+      tool,
+      historyRecordId: historyId,
+      cancelAccepted: true,
+      waitCanceled,
+      before: beforeSummary,
+      after: afterSummary,
+      cancelResult: {
+        httpStatus: cancelResult.httpStatus,
+        ret: cancelResult.ret,
+        errmsg: cancelResult.errmsg,
+        logid: cancelResult.logid
+      }
+    });
+  } finally {
+    await context.close();
+  }
+}
+
 async function commandFindRecord(args) {
   const options = parseCommonOptions(args);
   const trackedEntry = selectTrackedEntry(loadRegistryEntries(options.registryPath), args);
@@ -2253,6 +2927,11 @@ async function commandDownloadRecord(args) {
     let historyEntry = await fetchHistoryEntry(page, target.recordId).catch(() => null);
     tool = inferToolFromHistoryEntry(historyEntry) || tool;
 
+    const initialSummary = summarizeRecordStatus(target.recordId, tool, record, historyEntry);
+    if (initialSummary.isCanceled) {
+      throw new Error(`Record ${target.recordId} was canceled: ${initialSummary.failureReason || '你已取消生成，积分已返还'}`);
+    }
+
     if (waitComplete && (!recordIsComplete(record, tool) && !historyEntryIsComplete(historyEntry, tool))) {
       const waited = await waitForRecordCompletion(page, target.recordId, tool, waitTimeoutMs, pollIntervalMs);
       record = waited.record;
@@ -2268,6 +2947,11 @@ async function commandDownloadRecord(args) {
     const domComplete = recordIsComplete(record, tool);
     const apiComplete = historyEntryIsComplete(historyEntry, tool);
     const currentStatus = historyEntryStatusLabel(historyEntry) || record?.status || '-';
+    const currentSummary = summarizeRecordStatus(target.recordId, tool, record, historyEntry);
+    const imageCounts = tool === 'image' ? summarizeImageResultCounts(record, historyEntry) : null;
+    if (currentSummary.isCanceled) {
+      throw new Error(`Record ${target.recordId} was canceled: ${currentSummary.failureReason || '你已取消生成，积分已返还'}`);
+    }
     if (!domComplete && record && isFailureStatus(record.status)) {
       throw new Error(`Record ${target.recordId} failed: ${truncateText(record.text, 200)}`);
     }
@@ -2282,7 +2966,8 @@ async function commandDownloadRecord(args) {
     const downloads = [];
     const baseName = safeSlug(target.recordId, 'record');
     let downloadSource = 'dom';
-    if (apiComplete && !domComplete) {
+    const shouldPreferImageHistoryApi = tool === 'image' && apiComplete;
+    if (shouldPreferImageHistoryApi || (apiComplete && !domComplete)) {
       const apiDownloads = await saveHistoryEntryFiles(historyEntry, tool, outputDir, baseName);
       downloads.push(...apiDownloads);
       downloadSource = 'history-api';
@@ -2304,16 +2989,16 @@ async function commandDownloadRecord(args) {
         downloads.push(saved);
         logStep(`Downloaded video 1/1: ${saved.filePath}`);
       } else {
-        if (record.thumbnails.length < 4) {
-          throw new Error(`Record ${target.recordId} exposed only ${record.thumbnails.length} result thumbnails.`);
+        if (record.thumbnails.length < 1) {
+          throw new Error(`Record ${target.recordId} did not expose any downloadable result thumbnails.`);
         }
 
-        for (let i = 0; i < 4; i += 1) {
+        for (let i = 0; i < record.thumbnails.length; i += 1) {
           await record.locator.scrollIntoViewIfNeeded().catch(() => null);
           await openResultViewerFromCard(record.locator, i);
           const saved = await saveCurrentViewerImage(page, outputDir, baseName, i);
           downloads.push(saved);
-          logStep(`Downloaded image ${i + 1}/4: ${saved.filePath}`);
+          logStep(`Downloaded image ${i + 1}/${record.thumbnails.length}: ${saved.filePath}`);
           await closeViewer(page);
         }
       }
@@ -2328,6 +3013,10 @@ async function commandDownloadRecord(args) {
           tool,
           downloadedAt: isoTimestamp(),
           status: currentStatus,
+          partialFailure: Boolean(imageCounts?.partialFailure),
+          finishedCount: imageCounts?.successfulCount ?? null,
+          totalCount: imageCounts?.expectedCount ?? null,
+          failedCount: imageCounts?.failedCount ?? null,
           historyRecordId: historyEntry?.history_record_id || historyEntry?.task?.history_id || null,
           downloadSource,
           files: downloads
@@ -2345,6 +3034,10 @@ async function commandDownloadRecord(args) {
       outputDir,
       metadataPath,
       downloadSource,
+      partialFailure: Boolean(imageCounts?.partialFailure),
+      finishedCount: imageCounts?.successfulCount ?? null,
+      totalCount: imageCounts?.expectedCount ?? null,
+      failedCount: imageCounts?.failedCount ?? null,
       fileCount: downloads.length,
       files: downloads
     });
@@ -2358,9 +3051,10 @@ function printUsage() {
   node scripts/jimeng-browser.js login [--headless true|false] [--timeout-ms 180000]
   node scripts/jimeng-browser.js snapshot [--tool home|image|video|canvas]
   node scripts/jimeng-browser.js open-tool [--tool home|image|video|canvas]
-  node scripts/jimeng-browser.js generate --tool image|video --prompt "..." [--character-id alice] [--model "图片5.0 Lite"| "Seedance 2.0 Fast"] [--aspect "1:1"| "16:9"] [--resolution "高清 2K"| "720P"] [--duration "5s"] [--reference-mode "全能参考"] [--reference-file /abs/path]
+  node scripts/jimeng-browser.js generate --tool image|video --prompt "..." [--character-id alice] [--model "图片5.0 Lite"| "Seedance 2.0 Fast"] [--aspect "1:1"| "16:9"] [--resolution "高清 2K"| "720P"] [--duration "4s"| "5s"| "10s"| "15s"] [--reference-mode "全能参考"] [--reference-file /abs/path[,/abs/path2]]
   node scripts/jimeng-browser.js list-records [--tool image|video] [--character-id alice] [--limit 20]
   node scripts/jimeng-browser.js record-status --record-id <id> [--tool image|video]
+  node scripts/jimeng-browser.js cancel-record --record-id <id> [--tool video]
   node scripts/jimeng-browser.js find-record --record-id <id> [--tool image|video]
   node scripts/jimeng-browser.js find-record --character-id alice [--tool image|video]
   node scripts/jimeng-browser.js download-record --record-id <id> [--tool image|video] [--output-dir /abs/path]
@@ -2376,18 +3070,21 @@ Optional flags:
   --model "图片5.0 Lite"
   --aspect "1:1"
   --resolution "高清 2K"
-  --duration "5s"
+  --duration "4s"|"5s"|"10s"|"15s"
   --reference-mode "全能参考"|"首尾帧"|"智能多帧"|"主体参考"
   --first-frame-file /abs/path.png
   --last-frame-file /abs/path.png
   --submit-retries 2
   --submit-retry-delay-ms 60000
   --record-id-wait-ms 180000
+  --wait-canceled true|false
   --wait-complete true|false
   --wait-timeout-ms 900000
   --poll-interval-ms 15000
   --output-dir /abs/path
   --reference-file /abs/path[,/abs/path2]
+  In 全能参考 mode, uploaded references can be mentioned in --prompt as @图片1, @图片2, @视频1, @音频1
+  In 主体参考 mode, uploaded references can be mentioned as @主体, or as @主体1, @主体2 when multiple subjects are uploaded
   --image-file /abs/path[,/abs/path2]`);
 }
 
@@ -2417,6 +3114,9 @@ async function main() {
       return;
     case 'record-status':
       await commandRecordStatus(args);
+      return;
+    case 'cancel-record':
+      await commandCancelRecord(args);
       return;
     case 'download-record':
       await commandDownloadRecord(args);
