@@ -8,6 +8,8 @@ Verified during local testing on 2026-03-10.
 - `https://jimeng.jianying.com/ai-tool/home` loads the application shell and shows `登录` when the session is not authenticated.
 - `https://jimeng.jianying.com/ai-tool/generate/?type=image` is the authenticated image-generation route.
 - `https://jimeng.jianying.com/ai-tool/generate/?type=video` is the authenticated video-generation route.
+- `https://jimeng.jianying.com/ai-tool/assets-canvas` is the authenticated canvas project home.
+- `https://jimeng.jianying.com/ai-tool/canvas/<projectId>` is an individual canvas project window.
 - Even if logged-out pages expose prompt surfaces, treat the session as invalid and authenticate before generation.
 
 ## Observed login flow
@@ -29,6 +31,29 @@ Verified during local testing on 2026-03-10.
 - Logged-in video prompt placeholder: `输入文字，描述你想创作的画面内容、运动方式等。例如：一个3D形象的小男孩，在公园滑滑板。`
 - Logged-in image and video submit buttons both expose the class fragment `submit-button-KJTUYS`.
 - The blocking CapCut-binding dialog exposed a close target with the class fragment `close-icon-wrapper`.
+
+## Observed canvas behavior
+
+- The real canvas home route is `/ai-tool/assets-canvas`.
+- `新建项目` opens a separate browser window.
+- Clicking a project inside `最近项目` also opens a separate browser window.
+- Clicking the project name in the top-left header enters inline rename mode and exposes `input.title-input-BEs0ab`.
+- Verified live on 2026-03-13:
+  - `新建项目` opened `/ai-tool/canvas/9762472549900?enter_from=create_new&from_page=canvas_homepage`
+  - clicking `victor_测试` opened `/ai-tool/canvas/9363574966540?enter_from=assets&from_page=canvas_homepage`
+- The preferred project generation entry is the top-right `对话` drawer.
+- The project page currently shows a right-side conversation drawer with a ProseMirror editor and prompt text such as `Seedance 2.0全能参考，上传参考、输入文字，创意无限可能`.
+- Verified live on 2026-03-13: the drawer tool selector exposes `Agent 模式`, `图片生成`, and `视频生成`.
+- Verified live on 2026-03-13: switching the drawer to `图片生成` exposed the same style of image controls as the normal generate page, including image model, aspect ratio, and resolution controls.
+- Verified live on 2026-03-13: switching the drawer to `视频生成` exposed the same style of video controls as the normal generate page, including model, reference mode, duration, and aspect controls.
+- Verified live on 2026-03-13: after switching the drawer tool, the project URL gained `?type=image&workspace=0` or `?type=video&workspace=0`.
+- Verified live on 2026-03-13: a canvas image submit returned `recordId=8dcf370f-7c2d-4557-973e-38f14b71e5fb`.
+- Verified live on 2026-03-13: a canvas video submit returned `recordId=ff0f911f-2e5e-4594-b6b9-9a0718f6fda3`.
+- In both cases, the canvas record IDs behaved like normal JiMeng record IDs and can be handed to the existing record-status / download-record / cancel-record commands.
+- A visible `跳过` onboarding step may need to be dismissed before interacting with the project editor.
+- The visible project editor can exist alongside off-screen ProseMirror instances. Pure `isVisible()` is not enough; viewport-aware selection or direct DOM focus is safer.
+- Verified live on 2026-03-13: project prompts can be submitted for both image and video requests.
+- Verified live on 2026-03-13: after submit, the project first entered Agent planning states such as `意图分析` and `任务规划` before later JiMeng generation steps.
 
 ## Observed image-generation options
 

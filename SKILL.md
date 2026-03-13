@@ -1,6 +1,6 @@
 ---
 name: jimeng-browser-automation
-description: Automate JiMeng (即梦AI at jimeng.jianying.com) and Seedance video generation in a real browser with Playwright. Use for Douyin QR login, JiMeng image or video generation, record-id based status checks, canceling queued video tasks, and downloading completed results.
+description: Automate JiMeng (即梦AI at jimeng.jianying.com), Seedance video generation, and canvas projects in a real browser with Playwright. Use for Douyin QR login, JiMeng image or video generation, canvas project creation/opening/prompting, record-id based status checks, canceling queued video tasks, and downloading completed results.
 ---
 
 # JiMeng Browser Automation
@@ -61,7 +61,79 @@ node scripts/jimeng-browser.js login
 - Show the QR screenshot to the user and wait for a Douyin scan.
 - The persistent browser profile lives under `runtime/jimeng-profile/`.
 
-### 2. Generate image
+### 2. Open canvas home
+
+```bash
+node scripts/jimeng-browser.js open-tool --tool canvas
+```
+
+- The real canvas home route is `https://jimeng.jianying.com/ai-tool/assets-canvas`.
+- This page lists recent projects and a `新建项目` entry point.
+
+### 3. Create a canvas project
+
+```bash
+node scripts/jimeng-browser.js canvas-create-project --json true
+```
+
+- JiMeng opens the new project in a separate window.
+- The command captures that new window and returns `projectId`, `projectUrl`, and `projectTitle`.
+
+### 4. Open an existing canvas project
+
+```bash
+node scripts/jimeng-browser.js canvas-open-project --project-name "victor_测试" --json true
+```
+
+Optional:
+
+- `--project-index` when multiple projects share the same visible name
+- `--project-id`
+- `--project-url`
+
+Behavior:
+
+- Clicking a recent project also opens a separate window.
+- The command captures that new window and returns the resolved project URL.
+
+### 5. Rename a canvas project
+
+```bash
+node scripts/jimeng-browser.js canvas-rename-project --project-id 123456 --name "my_project" --json true
+```
+
+Behavior:
+
+- The current canvas page allows renaming by clicking the project name in the top-left header.
+- The automation enters the inline title input, replaces the name, and confirms it.
+
+### 6. Prompt inside a canvas project
+
+```bash
+node scripts/jimeng-browser.js canvas-prompt --project-id 123456 --kind image --prompt "一只白色柴犬坐在木桌上，白底，简洁插画风。" --json true
+```
+
+Optional:
+
+- `--kind image|video|auto`
+- `--reference-file /absolute/path[,/absolute/path2]`
+- `--project-name`
+- `--project-id`
+- `--project-url`
+
+Behavior:
+
+- The automation first ensures the top-right `对话` drawer is open.
+- It then uses the right-side conversation drawer input instead of the canvas bottom editor.
+- The drawer exposes the same `图片生成 / 视频生成` tool choices as the normal generate page.
+- The automation switches the drawer tool first, then reuses the normal image/video option logic.
+- The prompt is sent as normal generate content. It is not wrapped with extra `生成一张图片：...` or `生成一个视频：...` prefixes.
+- The command submits the prompt inside the project and now returns the underlying generation `recordId` when JiMeng surfaces it.
+- Once `recordId` is available, the normal `record-status`, `download-record`, and `cancel-record` commands can be reused.
+- The current observed project flow first enters an Agent planning phase before it calls JiMeng generation tools.
+- If the project prompt includes JiMeng reference mentions such as `@图片1` or `@主体1`, the automation inserts real mention tags instead of plain text.
+
+### 7. Generate image
 
 ```bash
 node scripts/jimeng-browser.js generate --tool image --prompt "一只白色柴犬站在雨夜霓虹街头" --json true
@@ -92,7 +164,7 @@ Behavior:
 - One image task can produce up to `4` result images.
 - Image tasks can partially fail. Treat them as finished with partial failure, not as a pure hard failure.
 
-### 3. Generate video
+### 8. Generate video
 
 ```bash
 node scripts/jimeng-browser.js generate --tool video --prompt "让一只小猫坐在窗边，看向窗外的雨夜" --json true
@@ -138,7 +210,7 @@ Behavior:
 --submit-retries 2 --submit-retry-delay-ms 60000 --record-id-wait-ms 180000
 ```
 
-### 4. Check task status
+### 9. Check task status
 
 ```bash
 node scripts/jimeng-browser.js record-status --record-id <record-id> --json true
@@ -162,7 +234,7 @@ Useful fields:
 - `auditFailurePhase`
 - `failureReason`
 
-### 5. Cancel queued video task
+### 10. Cancel queued video task
 
 ```bash
 node scripts/jimeng-browser.js cancel-record --record-id <record-id> --json true
@@ -172,7 +244,7 @@ node scripts/jimeng-browser.js cancel-record --record-id <record-id> --json true
 - Uses JiMeng's direct cancel API.
 - Works even if the card is no longer visible in the current list.
 
-### 6. Download result
+### 11. Download result
 
 ```bash
 node scripts/jimeng-browser.js download-record --record-id <record-id> --wait-complete true --json true
@@ -213,6 +285,20 @@ Important:
 
 - Plain text `@图片1` is not enough. The automation must select the popup option so JiMeng inserts a real mention tag node.
 - Verified live: `主体参考` submits reach JiMeng as structured reference nodes, not degraded plain text like `让@@`.
+- The same mention insertion logic is also reused inside canvas project prompts when the active project editor supports uploaded-material mentions.
+
+## Canvas project rules
+
+- Canvas home is `assets-canvas`, not the normal generate route.
+- `新建项目` opens a new canvas window at `/ai-tool/canvas/<projectId>?enter_from=create_new...`.
+- Clicking a recent project opens a new canvas window at `/ai-tool/canvas/<projectId>?enter_from=assets...`.
+- Clicking the project name in the top-left header enters inline rename mode.
+- The preferred project generation entry is the top-right `对话` drawer.
+- The drawer exposes `图片生成` and `视频生成`, and the resulting controls match the normal generate page closely enough to reuse the same option-selection logic.
+- For now, treat project creation requests as prompt-driven:
+  - image request -> `--kind image`
+  - video request -> `--kind video`
+- After submit, the project commonly enters `意图分析` / `任务规划` before the actual image/video generation step.
 
 ## Status model
 
@@ -241,6 +327,7 @@ Read [references/jimeng-flow.md](references/jimeng-flow.md) when you need:
 - exact current option labels
 - selector/debugging detail
 - route and login observations
+- canvas project window behavior
 - failure and queue API shape
 - mention behavior verification
 
@@ -250,6 +337,9 @@ These commands are useful for debugging site changes, but they are not part of t
 
 - `node scripts/jimeng-browser.js snapshot --tool image|video`
 - `node scripts/jimeng-browser.js open-tool --tool home|image|video|canvas`
+- `node scripts/jimeng-browser.js canvas-create-project`
+- `node scripts/jimeng-browser.js canvas-open-project --project-name "未命名项目"`
+- `node scripts/jimeng-browser.js canvas-prompt --project-id 123456 --prompt "..."`
 - `node scripts/jimeng-browser.js find-record --record-id <record-id>`
 - `node scripts/jimeng-browser.js list-records`
 

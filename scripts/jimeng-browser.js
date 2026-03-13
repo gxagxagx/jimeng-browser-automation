@@ -13,7 +13,7 @@ const TOOL_URLS = {
   home: 'https://jimeng.jianying.com/ai-tool/home',
   image: 'https://jimeng.jianying.com/ai-tool/generate/?type=image',
   video: 'https://jimeng.jianying.com/ai-tool/generate/?type=video',
-  canvas: 'https://jimeng.jianying.com/ai-tool/home'
+  canvas: 'https://jimeng.jianying.com/ai-tool/assets-canvas'
 };
 const SUBMIT_LABELS = [
   '生成',
@@ -151,7 +151,7 @@ async function isVisible(locator) {
   }
 }
 
-async function waitForNewPage(context, existingPages, timeoutMs) {
+async function waitForNewPage(context, existingPages, timeoutMs, description = 'new page') {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const page = context.pages().find((candidate) => !existingPages.has(candidate));
@@ -160,7 +160,7 @@ async function waitForNewPage(context, existingPages, timeoutMs) {
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error('Timed out waiting for the Douyin OAuth popup.');
+  throw new Error(`Timed out waiting for the ${description}.`);
 }
 
 function parseCommonOptions(args) {
@@ -1661,6 +1661,230 @@ async function navigateToTool(page, tool) {
   return page;
 }
 
+function buildCanvasProjectUrl(projectId) {
+  return `https://jimeng.jianying.com/ai-tool/canvas/${projectId}`;
+}
+
+function extractCanvasProjectId(value) {
+  const match = String(value || '').match(/\/ai-tool\/canvas\/(\d+)/);
+  return match ? match[1] : null;
+}
+
+function normalizeCanvasKind(value) {
+  const normalized = String(value || 'auto').trim().toLowerCase();
+  if (['image', '图片', 'img'].includes(normalized)) {
+    return 'image';
+  }
+  if (['video', '视频', 'vid'].includes(normalized)) {
+    return 'video';
+  }
+  return 'auto';
+}
+
+function buildCanvasPrompt(kind, prompt) {
+  const trimmed = String(prompt || '').trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  return trimmed;
+}
+
+async function dismissCanvasOnboarding(page) {
+  const skip = page.getByText('跳过', { exact: true }).first();
+  if (await isVisible(skip)) {
+    await skip.click({ force: true }).catch(() => null);
+    await page.waitForTimeout(500);
+  }
+}
+
+async function waitForCanvasProjectReady(page) {
+  await page.waitForLoadState('domcontentloaded');
+  await safeNetworkIdle(page, 10000);
+  await dismissBindingModal(page);
+  await dismissCanvasOnboarding(page);
+  return page;
+}
+
+async function openCanvasHome(page) {
+  await navigateToTool(page, 'canvas');
+  await safeNetworkIdle(page, 10000);
+  await dismissBindingModal(page);
+  return page;
+}
+
+async function clickAndWaitForPopup(page, context, locator, description, timeoutMs) {
+  const existingPages = new Set(context.pages());
+  await locator.click({ force: true });
+  const popup = await waitForNewPage(context, existingPages, timeoutMs, description);
+  await waitForCanvasProjectReady(popup);
+  return popup;
+}
+
+async function openCanvasProjectFromList(page, context, projectName, projectIndex, timeoutMs) {
+  const matches = page.getByText(projectName, { exact: true });
+  const count = await matches.count().catch(() => 0);
+  const visible = [];
+
+  for (let i = 0; i < count; i += 1) {
+    const current = matches.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 24 || box.height < 12) {
+      continue;
+    }
+    if (!(await isVisible(current))) {
+      continue;
+    }
+    visible.push(current);
+  }
+
+  if (!visible.length) {
+    throw new Error(`Could not find a visible canvas project named: ${projectName}`);
+  }
+
+  const targetIndex = Math.max(1, projectIndex || 1) - 1;
+  const target = visible[targetIndex];
+  if (!target) {
+    throw new Error(`Found ${visible.length} visible canvas project(s) named ${projectName}, but project-index ${projectIndex} is out of range.`);
+  }
+
+  return clickAndWaitForPopup(page, context, target, 'canvas project window', timeoutMs);
+}
+
+async function createCanvasProjectFromHome(page, context, timeoutMs) {
+  const button = page.getByText('新建项目', { exact: true }).first();
+  if (!(await isVisible(button))) {
+    throw new Error('Could not find the 新建项目 button on the canvas home page.');
+  }
+  return clickAndWaitForPopup(page, context, button, 'new canvas project window', timeoutMs);
+}
+
+async function resolveCanvasProjectPage(page, context, args, options) {
+  if (args['project-url']) {
+    await gotoAndSettle(page, args['project-url']);
+    await waitForCanvasProjectReady(page);
+    return page;
+  }
+
+  if (args['project-id']) {
+    await gotoAndSettle(page, buildCanvasProjectUrl(args['project-id']));
+    await waitForCanvasProjectReady(page);
+    return page;
+  }
+
+  if (args['project-name']) {
+    await openCanvasHome(page);
+    if (await pageLooksLoggedOut(page)) {
+      throw new Error('JiMeng is not logged in. Run the login command before opening a canvas project.');
+    }
+    return openCanvasProjectFromList(
+      page,
+      context,
+      args['project-name'],
+      integerFlag(args['project-index'], 1),
+      options.timeoutMs
+    );
+  }
+
+  if (extractCanvasProjectId(page.url())) {
+    await waitForCanvasProjectReady(page);
+    return page;
+  }
+
+  throw new Error('Canvas project commands require --project-url, --project-id, or --project-name.');
+}
+
+async function findCanvasConversationToggle(page) {
+  const button = page.getByRole('button', { name: '对话' }).first();
+  if (await button.count().catch(() => 0)) {
+    return button;
+  }
+  return null;
+}
+
+async function ensureCanvasConversationOpen(page) {
+  const existingEditor = await findCanvasPromptEditor(page);
+  if (existingEditor) {
+    return existingEditor;
+  }
+
+  const toggle = await findCanvasConversationToggle(page);
+  if (!toggle) {
+    return null;
+  }
+
+  await toggle.click({ force: true }).catch(() => null);
+  await page.waitForTimeout(800);
+  return findCanvasPromptEditor(page);
+}
+
+async function findCanvasPromptEditor(page) {
+  const viewport = page.viewportSize() || { width: 1280, height: 720 };
+  const editors = page.locator('[role="textbox"].ProseMirror');
+  const count = await editors.count().catch(() => 0);
+  for (let i = count - 1; i >= 0; i -= 1) {
+    const current = editors.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 120 || box.height < 20) {
+      continue;
+    }
+    if (box.y < -20 || box.y > viewport.height + 40) {
+      continue;
+    }
+    if (await isVisible(current)) {
+      return { type: 'editor', locator: current };
+    }
+  }
+  return findPromptTarget(page, { preferRichEditor: true, scope: page.locator('body') });
+}
+
+async function renameCanvasProject(page, newName) {
+  const titleTarget = page.locator('input.title-input-BEs0ab').first();
+  if (!(await titleTarget.count().catch(() => 0))) {
+    const titleText = page.locator('header').getByText(/\S+/).first();
+    if (await titleText.count().catch(() => 0)) {
+      await titleText.click({ force: true }).catch(() => null);
+      await page.waitForTimeout(300);
+    }
+  }
+
+  const titleInput = page.locator('input.title-input-BEs0ab').first();
+  if (!(await titleInput.count().catch(() => 0))) {
+    throw new Error('Could not find the canvas project title input.');
+  }
+
+  await titleInput.click({ force: true }).catch(() => null);
+  await titleInput.fill(String(newName));
+  await page.keyboard.press('Enter').catch(() => null);
+  await page.waitForTimeout(600);
+  await titleInput.blur().catch(() => null);
+  await page.waitForTimeout(600);
+  return true;
+}
+
+function summarizeCanvasProjectState(bodyText) {
+  const text = String(bodyText || '');
+  const statusMatch = text.match(/生成中\.\.\.|创意规划中|意图分析|任务规划|生成失败|已完成|已取消/);
+  const progressMatch = text.match(/\b\d+\/\d+\b|\b\d+%\b/);
+  return {
+    status: statusMatch ? statusMatch[0] : null,
+    progressText: progressMatch ? progressMatch[0] : null
+  };
+}
+
+async function getCanvasProjectName(page) {
+  const titleInput = page.locator('input.title-input-BEs0ab').first();
+  if (await titleInput.count().catch(() => 0)) {
+    const value = await titleInput.inputValue().catch(() => '');
+    if (value.trim()) {
+      return value.trim();
+    }
+  }
+
+  const body = await getBodyText(page, 400);
+  const firstLine = String(body || '').split('\n').map((line) => line.trim()).find(Boolean);
+  return firstLine || null;
+}
+
 async function findPromptTarget(page, options = {}) {
   const preferRichEditor = Boolean(options.preferRichEditor);
   const scope = options.scope || await getActiveGeneratorRoot(page).catch(() => null) || page;
@@ -1774,11 +1998,23 @@ async function editorIsEffectivelyEmpty(locator) {
   }).catch(() => false);
 }
 
-async function clearEditor(locator) {
-  const page = locator.page();
-  await locator.click({ force: true });
+async function focusEditor(locator) {
   await locator.evaluate((node) => {
     node.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }).catch(() => null);
+  await locator.page().waitForTimeout(120);
+}
+
+async function clearEditor(locator) {
+  const page = locator.page();
+  await focusEditor(locator);
+  await locator.evaluate((node) => {
     const selection = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(node);
@@ -1850,7 +2086,7 @@ async function fillEditorPrompt(locator, prompt, options = {}) {
   if (!(await editorIsEffectivelyEmpty(locator))) {
     await clearEditor(locator);
   } else {
-    await locator.click({ force: true });
+    await focusEditor(locator);
   }
 
   const tokens = enableReferenceMentions
@@ -2069,6 +2305,55 @@ async function chooseSelectOption(page, selectIndex, optionText) {
   return true;
 }
 
+async function chooseVisibleSelectOption(page, optionText, matchText = null) {
+  if (!optionText) {
+    return false;
+  }
+
+  const selects = page.locator('.lv-select[role="combobox"]');
+  const visibleSelects = [];
+  const selectCount = await selects.count().catch(() => 0);
+  for (let i = 0; i < selectCount; i += 1) {
+    const current = selects.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 20 || box.height < 12) {
+      continue;
+    }
+    if (!(await isVisible(current))) {
+      continue;
+    }
+    const text = normalizeWhitespace(await current.innerText().catch(() => ''));
+    visibleSelects.push({ locator: current, text, box });
+  }
+
+  const target = matchText
+    ? visibleSelects.find((item) => item.text.includes(matchText))
+    : visibleSelects[0];
+  const resolvedTarget = target || visibleSelects[0] || null;
+
+  if (!resolvedTarget) {
+    return false;
+  }
+
+  await resolvedTarget.locator.evaluate((node) => node.click()).catch(() => null);
+  await page.waitForTimeout(300);
+
+  const options = page.locator('.lv-select-option');
+  const optionCount = await options.count().catch(() => 0);
+  for (let i = 0; i < optionCount; i += 1) {
+    const current = options.nth(i);
+    const text = normalizeWhitespace(await current.innerText().catch(() => ''));
+    if (text !== optionText) {
+      continue;
+    }
+    await current.evaluate((node) => node.click()).catch(() => null);
+    await page.waitForTimeout(500);
+    return true;
+  }
+
+  return false;
+}
+
 async function getVisibleComboboxTexts(page) {
   const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
   const combos = scope.locator('[role="combobox"]');
@@ -2199,6 +2484,27 @@ async function configureVideoOptions(page, args) {
   await verifyVideoOptionSelections(page, args);
 }
 
+async function selectCanvasConversationTool(page, tool) {
+  const label = tool === 'image' ? '图片生成' : tool === 'video' ? '视频生成' : null;
+  if (!label) {
+    return false;
+  }
+
+  const chosen = await chooseVisibleSelectOption(page, label, '模式');
+  if (chosen) {
+    await page.waitForTimeout(800);
+    return true;
+  }
+
+  const fallbackChosen = await chooseVisibleSelectOption(page, label, 'Agent');
+  if (fallbackChosen) {
+    await page.waitForTimeout(800);
+    return true;
+  }
+
+  throw new Error(`Could not switch the canvas conversation tool to ${label}.`);
+}
+
 function createTrackedRecordEntry(args, tool, prompt, recordCard) {
   return {
     createdAt: isoTimestamp(),
@@ -2322,6 +2628,356 @@ async function commandOpenTool(args) {
     }
     logStep(`Opened ${tool}. URL: ${page.url()}`);
     logStep(`Page title: ${await page.title()}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function commandCanvasCreateProject(args) {
+  const options = parseCommonOptions(args);
+  const context = await launchContext(options);
+
+  try {
+    const page = await getMainPage(context);
+    await openCanvasHome(page);
+    if (await pageLooksLoggedOut(page)) {
+      throw new Error('JiMeng is not logged in. Run the login command before creating a canvas project.');
+    }
+
+    const projectPage = await createCanvasProjectFromHome(page, context, options.timeoutMs);
+    const projectId = extractCanvasProjectId(projectPage.url());
+    const snapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-create-project');
+    logStep(`Created a new canvas project window. URL: ${projectPage.url()}`);
+    logStep(`Saved canvas project snapshot: ${snapshot.screenshot}`);
+
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'canvas-create-project',
+      projectId,
+      projectUrl: projectPage.url(),
+      projectTitle: await projectPage.title(),
+      projectName: await getCanvasProjectName(projectPage),
+      screenshot: snapshot.screenshot,
+      snapshotJson: snapshot.jsonPath,
+      snapshotText: snapshot.textPath
+    });
+  } finally {
+    await context.close();
+  }
+}
+
+async function commandCanvasOpenProject(args) {
+  if (!args['project-name'] && !args['project-id'] && !args['project-url']) {
+    throw new Error('The canvas-open-project command requires --project-name, --project-id, or --project-url.');
+  }
+
+  const options = parseCommonOptions(args);
+  const context = await launchContext(options);
+
+  try {
+    const page = await getMainPage(context);
+    let projectPage = null;
+
+    if (args['project-name']) {
+      await openCanvasHome(page);
+      if (await pageLooksLoggedOut(page)) {
+        throw new Error('JiMeng is not logged in. Run the login command before opening a canvas project.');
+      }
+      projectPage = await openCanvasProjectFromList(
+        page,
+        context,
+        args['project-name'],
+        integerFlag(args['project-index'], 1),
+        options.timeoutMs
+      );
+    } else {
+      projectPage = await resolveCanvasProjectPage(page, context, args, options);
+    }
+
+    const projectId = extractCanvasProjectId(projectPage.url());
+    const snapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-open-project');
+    logStep(`Opened canvas project. URL: ${projectPage.url()}`);
+
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'canvas-open-project',
+      projectId,
+      projectUrl: projectPage.url(),
+      projectTitle: await projectPage.title(),
+      projectName: await getCanvasProjectName(projectPage),
+      screenshot: snapshot.screenshot,
+      snapshotJson: snapshot.jsonPath,
+      snapshotText: snapshot.textPath
+    });
+  } finally {
+    await context.close();
+  }
+}
+
+async function commandCanvasRenameProject(args) {
+  const newName = args.name || args['new-name'];
+  if (!newName) {
+    throw new Error('The canvas-rename-project command requires --name "..."');
+  }
+
+  const options = parseCommonOptions(args);
+  const context = await launchContext(options);
+
+  try {
+    const page = await getMainPage(context);
+    const projectPage = await resolveCanvasProjectPage(page, context, args, options);
+    if (await pageLooksLoggedOut(projectPage)) {
+      throw new Error('JiMeng is not logged in. Run the login command before renaming a canvas project.');
+    }
+
+    await renameCanvasProject(projectPage, newName);
+    const snapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-rename-project');
+    const projectId = extractCanvasProjectId(projectPage.url());
+    logStep(`Renamed canvas project to: ${newName}`);
+
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'canvas-rename-project',
+      projectId,
+      projectUrl: projectPage.url(),
+      projectTitle: await projectPage.title(),
+      projectName: await getCanvasProjectName(projectPage),
+      name: newName,
+      screenshot: snapshot.screenshot,
+      snapshotJson: snapshot.jsonPath,
+      snapshotText: snapshot.textPath
+    });
+  } finally {
+    await context.close();
+  }
+}
+
+async function commandCanvasPrompt(args) {
+  const prompt = args.prompt;
+  if (!prompt) {
+    throw new Error('The canvas-prompt command requires --prompt "..."');
+  }
+
+  const options = parseCommonOptions(args);
+  const context = await launchContext(options);
+
+  try {
+    const page = await getMainPage(context);
+    const projectPage = await resolveCanvasProjectPage(page, context, args, options);
+    if (await pageLooksLoggedOut(projectPage)) {
+      throw new Error('JiMeng is not logged in. Run the login command before using a canvas project.');
+    }
+
+    let target = await ensureCanvasConversationOpen(projectPage);
+    if (!target) {
+      throw new Error('Could not find the canvas project conversation editor.');
+    }
+
+    const kind = normalizeCanvasKind(args.kind);
+    let resolvedTool = kind === 'auto' ? null : kind;
+    if (resolvedTool) {
+      await selectCanvasConversationTool(projectPage, resolvedTool);
+      if (resolvedTool === 'image') {
+        await configureImageOptions(projectPage, args);
+      } else if (resolvedTool === 'video') {
+        await configureVideoOptions(projectPage, args);
+      }
+      target = await ensureCanvasConversationOpen(projectPage);
+      if (!target) {
+        throw new Error('Could not find the canvas project conversation editor after switching tools.');
+      }
+    }
+
+    const composedPrompt = buildCanvasPrompt(kind, prompt);
+    if (!resolvedTool) {
+      if (projectPage.url().includes('type=video')) {
+        resolvedTool = 'video';
+      } else if (projectPage.url().includes('type=image')) {
+        resolvedTool = 'image';
+      }
+    }
+
+    const genericReferenceInput = args['reference-file'] || args['image-file'];
+    const needsReferenceMentions = /@主体\d*|@(图片|视频|音频)\d+/.test(composedPrompt);
+    const uploadRequested = resolvedTool === 'video'
+      ? Boolean(genericReferenceInput || args['first-frame-file'] || args['last-frame-file'])
+      : Boolean(genericReferenceInput);
+    const uploadBeforePrompt = resolvedTool === 'video'
+      && Boolean(genericReferenceInput)
+      && needsReferenceMentions;
+    let uploadWorked = false;
+
+    if (uploadBeforePrompt) {
+      uploadWorked = await maybeUploadVideoReferences(projectPage, args);
+      if (needsReferenceMentions && !uploadWorked) {
+        throw new Error('Could not upload the canvas video reference files before inserting @ mentions.');
+      }
+      if (uploadWorked) {
+        await waitForVideoReferenceEditorReady(projectPage, 10000);
+      }
+      if (uploadWorked && needsReferenceMentions) {
+        await projectPage.waitForTimeout(5000);
+      }
+      target = await ensureCanvasConversationOpen(projectPage);
+      if (!target) {
+        throw new Error('Could not find the canvas project conversation editor after video reference upload.');
+      }
+    }
+
+    await fillPrompt(target, composedPrompt, { enableReferenceMentions: needsReferenceMentions });
+
+    if (!uploadBeforePrompt) {
+      uploadWorked = resolvedTool === 'video'
+        ? await maybeUploadVideoReferences(projectPage, args)
+        : await maybeUploadImage(projectPage, genericReferenceInput);
+    }
+
+    if (uploadRequested) {
+      const uploadLabel = resolvedTool === 'video'
+        ? 'Uploaded the canvas video reference file(s).'
+        : 'Uploaded the canvas reference image file(s).';
+      const uploadMissLabel = resolvedTool === 'video'
+        ? 'Did not find a file input for the canvas video reference upload.'
+        : 'Did not find a file input for the canvas reference image upload.';
+      logStep(uploadWorked ? uploadLabel : uploadMissLabel);
+    }
+
+    const submitButton = await findSubmitButton(projectPage);
+    if (!submitButton) {
+      throw new Error('Could not find the canvas project submit button.');
+    }
+    const submitRetries = integerFlag(args['submit-retries'], resolvedTool === 'video' ? 2 : 0);
+    const retryDelayMs = integerFlag(args['submit-retry-delay-ms'], resolvedTool === 'video' ? 60000 : 15000);
+    const recordIdWaitMs = integerFlag(args['record-id-wait-ms'], resolvedTool === 'video' ? 180000 : 60000);
+    let trackedRecord = null;
+    let submitSignal = 'no-signal';
+    let pendingMarker = null;
+    let attemptCount = 0;
+    let generateApiResult = null;
+    let submitRequestPath = null;
+    let beforeSnapshot = null;
+    let afterSnapshot = null;
+
+    for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
+      attemptCount = attempt + 1;
+      const previousRecordIds = new Set((await collectLoadedRecordCards(projectPage)).map((card) => card.recordId));
+      beforeSnapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-before-submit');
+      const generateApiPromise = waitForGenerateApiResult(projectPage, Math.min(options.timeoutMs, 30000));
+      await submitButton.locator.click({ force: true });
+      generateApiResult = await generateApiPromise;
+      if (!submitRequestPath && generateApiResult?.requestBody) {
+        submitRequestPath = artifactPath(options.artifactsDir, 'canvas-submit-request', 'json');
+        fs.writeFileSync(submitRequestPath, JSON.stringify(generateApiResult.requestBody, null, 2));
+      }
+
+      if (generateApiResult && !generateApiResult.accepted) {
+        const serverMessage = `Server rejected canvas submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
+        if (attempt < submitRetries) {
+          logStep(`${serverMessage}. Waiting ${retryDelayMs}ms before retrying.`);
+          await projectPage.waitForTimeout(retryDelayMs);
+          await dismissBindingModal(projectPage);
+          continue;
+        }
+        throw new Error(serverMessage);
+      }
+
+      const submitState = await waitForSubmitState(projectPage, {
+        previousIds: previousRecordIds,
+        prompt: composedPrompt,
+        tool: resolvedTool,
+        timeoutMs: Math.min(options.timeoutMs, resolvedTool === 'video' ? 30000 : 20000)
+      });
+      await projectPage.waitForTimeout(integerFlag(args['wait-after-submit-ms'], 8000));
+      afterSnapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-after-submit');
+
+      if (submitState.recordCard) {
+        trackedRecord = {
+          ...submitState.recordCard,
+          historyRecordId: generateApiResult?.historyRecordId || null,
+          taskId: generateApiResult?.taskId || null
+        };
+        submitSignal = submitState.signal;
+        pendingMarker = submitState.pendingMarker || null;
+        break;
+      }
+
+      if (submitState.signal === 'video-pending') {
+        submitSignal = submitState.signal;
+        pendingMarker = submitState.pendingMarker || null;
+        trackedRecord = await waitForDelayedRecordCard(projectPage, {
+          prompt: composedPrompt,
+          timeoutMs: Math.min(options.timeoutMs, recordIdWaitMs),
+          reloadIntervalMs: 15000
+        });
+        if (trackedRecord) {
+          submitSignal = 'delayed-record';
+          trackedRecord = {
+            ...trackedRecord,
+            historyRecordId: generateApiResult?.historyRecordId || null,
+            taskId: generateApiResult?.taskId || null
+          };
+        } else if (generateApiResult?.accepted) {
+          submitSignal = 'server-accepted-no-record-id';
+        }
+        break;
+      }
+
+      if (attempt < submitRetries) {
+        logStep(`No clear canvas success signal after submit attempt ${attemptCount}/${submitRetries + 1}. Waiting ${retryDelayMs}ms before retrying.`);
+        await projectPage.waitForTimeout(retryDelayMs);
+        await dismissBindingModal(projectPage);
+      }
+    }
+
+    const bodyText = await getBodyText(projectPage, 12000);
+    const summary = summarizeCanvasProjectState(bodyText);
+    const projectId = extractCanvasProjectId(projectPage.url());
+    const projectName = await getCanvasProjectName(projectPage);
+
+    logStep(`Submitted a canvas project prompt to ${projectPage.url()}`);
+    if (summary.status) {
+      logStep(`Canvas project state: ${summary.status}${summary.progressText ? ` (${summary.progressText})` : ''}`);
+    }
+
+    let registryEntry = null;
+    if (trackedRecord && resolvedTool) {
+      registryEntry = createTrackedRecordEntry(args, resolvedTool, composedPrompt, trackedRecord);
+      appendRegistryEntry(options.registryPath, registryEntry);
+      logStep(`Tracked recordId=${registryEntry.recordId}`);
+    }
+
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'canvas-prompt',
+      projectId,
+      projectUrl: projectPage.url(),
+      projectTitle: await projectPage.title(),
+      projectName,
+      kind,
+      tool: resolvedTool,
+      prompt: composedPrompt,
+      recordId: registryEntry?.recordId || null,
+      historyRecordId: trackedRecord?.historyRecordId || generateApiResult?.historyRecordId || null,
+      taskId: trackedRecord?.taskId || generateApiResult?.taskId || null,
+      submitId: generateApiResult?.submitId || null,
+      submitSignal,
+      pendingMarker,
+      attemptCount,
+      serverAccepted: generateApiResult?.accepted || false,
+      serverRet: generateApiResult?.ret ?? null,
+      serverErrmsg: generateApiResult?.errmsg ?? null,
+      status: summary.status,
+      progressText: summary.progressText,
+      beforeSnapshot: beforeSnapshot?.screenshot || null,
+      afterSnapshot: afterSnapshot?.screenshot || null,
+      screenshot: afterSnapshot?.screenshot || null,
+      snapshotJson: afterSnapshot?.jsonPath || null,
+      snapshotText: afterSnapshot?.textPath || null,
+      submitRequestPath,
+      registryPath: options.registryPath,
+      trackingSaved: Boolean(registryEntry),
+      registryEntry
+    });
   } finally {
     await context.close();
   }
@@ -3051,6 +3707,10 @@ function printUsage() {
   node scripts/jimeng-browser.js login [--headless true|false] [--timeout-ms 180000]
   node scripts/jimeng-browser.js snapshot [--tool home|image|video|canvas]
   node scripts/jimeng-browser.js open-tool [--tool home|image|video|canvas]
+  node scripts/jimeng-browser.js canvas-create-project
+  node scripts/jimeng-browser.js canvas-open-project [--project-name "未命名项目"] [--project-index 1] [--project-id 12345] [--project-url https://jimeng.jianying.com/ai-tool/canvas/12345]
+  node scripts/jimeng-browser.js canvas-rename-project [--project-name "未命名项目"|--project-id 12345|--project-url https://jimeng.jianying.com/ai-tool/canvas/12345] --name "新项目名"
+  node scripts/jimeng-browser.js canvas-prompt [--project-name "未命名项目"|--project-id 12345|--project-url https://jimeng.jianying.com/ai-tool/canvas/12345] --prompt "..." [--kind image|video|auto] [--reference-file /abs/path[,/abs/path2]]
   node scripts/jimeng-browser.js generate --tool image|video --prompt "..." [--character-id alice] [--model "图片5.0 Lite"| "Seedance 2.0 Fast"] [--aspect "1:1"| "16:9"] [--resolution "高清 2K"| "720P"] [--duration "4s"| "5s"| "10s"| "15s"] [--reference-mode "全能参考"] [--reference-file /abs/path[,/abs/path2]]
   node scripts/jimeng-browser.js list-records [--tool image|video] [--character-id alice] [--limit 20]
   node scripts/jimeng-browser.js record-status --record-id <id> [--tool image|video]
@@ -3066,6 +3726,12 @@ Optional flags:
   --headless true|false
   --json true|false
   --timeout-ms 180000
+  --project-name "未命名项目"
+  --project-index 1
+  --project-id 12345
+  --project-url https://jimeng.jianying.com/ai-tool/canvas/12345
+  --kind image|video|auto
+  --wait-after-submit-ms 8000
   --character-id alice
   --model "图片5.0 Lite"
   --aspect "1:1"
@@ -3102,6 +3768,18 @@ async function main() {
       return;
     case 'open-tool':
       await commandOpenTool(args);
+      return;
+    case 'canvas-create-project':
+      await commandCanvasCreateProject(args);
+      return;
+    case 'canvas-open-project':
+      await commandCanvasOpenProject(args);
+      return;
+    case 'canvas-rename-project':
+      await commandCanvasRenameProject(args);
+      return;
+    case 'canvas-prompt':
+      await commandCanvasPrompt(args);
       return;
     case 'generate':
       await commandGenerate(args);

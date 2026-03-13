@@ -1,12 +1,13 @@
 # JiMeng Browser Automation
 
-Playwright-based browser automation for [JiMeng AI](https://jimeng.jianying.com) (即梦AI), including hot video models such as `Seedance 2.0 Fast` and `Seedance 2.0`.
+Playwright-based browser automation for [JiMeng AI](https://jimeng.jianying.com) (即梦AI), including hot video models such as `Seedance 2.0 Fast` and `Seedance 2.0`, plus canvas project automation.
 
 It supports:
 
 - Douyin QR login
 - image generation
 - video generation
+- canvas project creation/opening/prompting
 - `record-id` based status checks
 - queued video cancelation
 - image/video download
@@ -71,6 +72,34 @@ node scripts/jimeng-browser.js cancel-record \
   --json true
 ```
 
+Canvas project workflow:
+
+```bash
+# Open canvas home
+node scripts/jimeng-browser.js open-tool --tool canvas
+
+# Create a new project (opens a new window and returns projectId/projectUrl)
+node scripts/jimeng-browser.js canvas-create-project --json true
+
+# Open an existing project by name
+node scripts/jimeng-browser.js canvas-open-project \
+  --project-name "victor_测试" \
+  --json true
+
+# Rename a project
+node scripts/jimeng-browser.js canvas-rename-project \
+  --project-id <project-id> \
+  --name "my_project" \
+  --json true
+
+# Prompt inside a project via the top-right conversation drawer
+node scripts/jimeng-browser.js canvas-prompt \
+  --project-id <project-id> \
+  --kind image \
+  --prompt "一只白色柴犬坐在木桌上，白底，简洁插画风。" \
+  --json true
+```
+
 ## Normal workflow
 
 1. `login`
@@ -81,6 +110,12 @@ node scripts/jimeng-browser.js cancel-record \
 Use `cancel-record` only for queued video tasks you want to stop.
 
 Always track tasks by `record-id`, not by page order.
+
+For canvas projects:
+
+1. `open-tool --tool canvas`
+2. `canvas-create-project` or `canvas-open-project`
+3. `canvas-prompt`
 
 ## Common options
 
@@ -172,6 +207,34 @@ Some video modes use JiMeng mention tokens inside the prompt to bind uploaded ma
 - `智能多帧`: do not rely on prompt mention tokens
 
 Important: plain text like `@图片1` is not enough by itself. The script converts these tokens into real JiMeng mention tags before submit.
+
+## Canvas projects
+
+The real canvas home route is:
+
+- `https://jimeng.jianying.com/ai-tool/assets-canvas`
+
+Observed behavior:
+
+- `新建项目` opens a new browser window
+- clicking a recent project also opens a new browser window
+- clicking the project name in the top-left header enters inline rename mode
+- use the top-right `对话` drawer as the project generation entry
+- the drawer itself exposes `图片生成` and `视频生成`
+- the drawer controls behave like the normal generate page, so the same model/aspect/resolution/duration/reference-mode flags can be reused there
+
+Current project-generation rule:
+
+- use `--kind image` to submit an image request
+- use `--kind video` to submit a video request
+- the prompt itself stays raw, like the normal generate page
+
+Observed project flow:
+
+- after submit, the project commonly enters `意图分析` or `任务规划`
+- then Agent continues toward JiMeng generation inside the project
+- when JiMeng surfaces the underlying task card, `canvas-prompt` now returns the standard `recordId`
+- after that, you can reuse `record-status`, `download-record`, and `cancel-record`
 
 ## High-traffic Seedance behavior
 
