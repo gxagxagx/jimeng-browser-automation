@@ -432,6 +432,50 @@ async function checkAndThrowInsufficientCredits(page) {
   }
 }
 
+async function closeAnyModal(page) {
+  const modalWrapper = page.locator(MODAL_WRAPPER_SELECTOR).first();
+  if (!(await isVisible(modalWrapper))) {
+    return false;
+  }
+
+  // Get modal text for logging
+  const modalText = await modalWrapper.innerText().catch(() => '');
+  const firstLine = modalText.split('\n')[0].slice(0, 50);
+
+  // Try to find and click confirm button first (for safety confirmation, etc.)
+  const confirmButtons = modalWrapper.locator('button');
+  const btnCount = await confirmButtons.count();
+  for (let i = 0; i < btnCount; i++) {
+    const btn = confirmButtons.nth(i);
+    const btnText = (await btn.innerText().catch(() => '')).trim();
+    if (btnText === '确认' || btnText === '确定' || btnText === '同意' || btnText === 'OK') {
+      await btn.click();
+      await page.waitForTimeout(500);
+      logStep(`Closed modal by clicking "${btnText}": ${firstLine}...`);
+      return true;
+    }
+  }
+
+  // Try Escape key
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(500);
+  if (!(await isVisible(modalWrapper))) {
+    logStep(`Closed modal by pressing Escape: ${firstLine}...`);
+    return true;
+  }
+
+  // Try close button (usually first or last button)
+  const closeBtn = confirmButtons.first();
+  if (await isVisible(closeBtn)) {
+    await closeBtn.click();
+    await page.waitForTimeout(500);
+    logStep(`Closed modal by clicking first button: ${firstLine}...`);
+    return true;
+  }
+
+  return false;
+}
+
 async function collectVisibleElements(page) {
   const locator = page.locator('button, a, [role="button"], input, textarea, [contenteditable="true"]');
   const count = Math.min(await locator.count(), 80);
@@ -2953,11 +2997,24 @@ async function commandCanvasPrompt(args) {
       // Check for insufficient credits modal before clicking submit
       await checkAndThrowInsufficientCredits(projectPage);
 
+      // Close any blocking modal (safety confirmation, etc.)
+      await closeAnyModal(projectPage);
+
       const generateApiPromise = waitForGenerateApiResult(projectPage, Math.min(options.timeoutMs, 30000));
       await submitButton.locator.click({ force: true });
 
-      // Wait a moment and check if insufficient credits modal appeared after click
+      // Wait a moment and check for modals after click
       await projectPage.waitForTimeout(500);
+
+      // Check if a safety confirmation modal appeared and handle it
+      const modalClosed = await closeAnyModal(projectPage);
+      if (modalClosed) {
+        // Modal was closed, wait a bit and try clicking submit again
+        await projectPage.waitForTimeout(300);
+        await submitButton.locator.click({ force: true });
+        await projectPage.waitForTimeout(500);
+      }
+
       await checkAndThrowInsufficientCredits(projectPage);
 
       generateApiResult = await generateApiPromise;
@@ -3191,12 +3248,25 @@ async function commandGenerate(args) {
       // Check for insufficient credits modal before clicking submit
       await checkAndThrowInsufficientCredits(page);
 
+      // Close any blocking modal (safety confirmation, etc.)
+      await closeAnyModal(page);
+
       logStep(`Clicking submit button: ${submitButton.label}`);
       const generateApiPromise = waitForGenerateApiResult(page, Math.min(options.timeoutMs, 30000));
       await submitButton.locator.click();
 
-      // Wait a moment and check if insufficient credits modal appeared after click
+      // Wait a moment and check for modals after click
       await page.waitForTimeout(500);
+
+      // Check if a safety confirmation modal appeared and handle it
+      const modalClosed = await closeAnyModal(page);
+      if (modalClosed) {
+        // Modal was closed, wait a bit and try clicking submit again
+        await page.waitForTimeout(300);
+        await submitButton.locator.click();
+        await page.waitForTimeout(500);
+      }
+
       await checkAndThrowInsufficientCredits(page);
 
       generateApiResult = await generateApiPromise;
