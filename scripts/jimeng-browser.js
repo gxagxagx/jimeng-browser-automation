@@ -355,6 +355,83 @@ async function dismissBindingModal(page) {
   return false;
 }
 
+// Credits-related keywords that indicate insufficient credits modal
+const INSUFFICIENT_CREDITS_KEYWORDS = [
+  '积分不足',
+  '余额不足',
+  '积分不够',
+  '没有足够的积分',
+  '积分已用完',
+  '请充值',
+  '去充值',
+  '立即充值',
+  '获得更多积分',
+  'Insufficient credits',
+  'Not enough credits'
+];
+
+// Modal wrapper class used by JiMeng for credit warning modals
+const MODAL_WRAPPER_SELECTOR = '.lv-modal-wrapper';
+
+async function detectInsufficientCreditsModal(page) {
+  // Check for modal wrapper presence
+  const modalWrapper = page.locator(MODAL_WRAPPER_SELECTOR).first();
+  if (!(await isVisible(modalWrapper))) {
+    return null;
+  }
+
+  // Get modal text content
+  const modalText = await modalWrapper.innerText().catch(() => '');
+  const normalizedText = modalText.toLowerCase();
+
+  // Check for insufficient credits keywords
+  for (const keyword of INSUFFICIENT_CREDITS_KEYWORDS) {
+    if (modalText.includes(keyword) || normalizedText.includes(keyword.toLowerCase())) {
+      // Try to extract credit amount if available
+      const creditMatch = modalText.match(/(\d+)\s*积分/) || modalText.match(/(\d+)\s*credits?/i);
+      const creditAmount = creditMatch ? creditMatch[1] : null;
+
+      // Try to find the close button
+      const closeButton = modalWrapper.locator('button, [role="button"]').first();
+
+      return {
+        detected: true,
+        keyword,
+        creditAmount,
+        modalText: modalText.slice(0, 500),
+        closeButton: await isVisible(closeButton) ? closeButton : null
+      };
+    }
+  }
+
+  return null;
+}
+
+async function dismissInsufficientCreditsModal(page) {
+  const modalInfo = await detectInsufficientCreditsModal(page);
+  if (!modalInfo) {
+    return null;
+  }
+
+  // Try to close the modal
+  if (modalInfo.closeButton) {
+    await modalInfo.closeButton.click({ force: true });
+    await page.waitForTimeout(400);
+  }
+
+  return modalInfo;
+}
+
+async function checkAndThrowInsufficientCredits(page) {
+  const modalInfo = await detectInsufficientCreditsModal(page);
+  if (modalInfo) {
+    const creditMsg = modalInfo.creditAmount
+      ? `当前积分: ${modalInfo.creditAmount}`
+      : '请检查账户积分余额';
+    throw new Error(`积分不足，无法生成内容。${creditMsg}。弹窗提示: "${modalInfo.keyword}"`);
+  }
+}
+
 async function collectVisibleElements(page) {
   const locator = page.locator('button, a, [role="button"], input, textarea, [contenteditable="true"]');
   const count = Math.min(await locator.count(), 80);
@@ -494,6 +571,16 @@ async function waitForSubmitState(page, options) {
   const started = Date.now();
 
   while (Date.now() - started < options.timeoutMs) {
+    // Check for insufficient credits modal during wait
+    const creditModal = await detectInsufficientCreditsModal(page);
+    if (creditModal) {
+      return {
+        recordCard: null,
+        signal: 'insufficient-credits',
+        creditModal
+      };
+    }
+
     const cards = await collectLoadedRecordCards(page);
     const freshCard = cards.find((card) => !options.previousIds.has(card.recordId));
     if (freshCard) {
@@ -2862,8 +2949,17 @@ async function commandCanvasPrompt(args) {
       attemptCount = attempt + 1;
       const previousRecordIds = new Set((await collectLoadedRecordCards(projectPage)).map((card) => card.recordId));
       beforeSnapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-before-submit');
+
+      // Check for insufficient credits modal before clicking submit
+      await checkAndThrowInsufficientCredits(projectPage);
+
       const generateApiPromise = waitForGenerateApiResult(projectPage, Math.min(options.timeoutMs, 30000));
       await submitButton.locator.click({ force: true });
+
+      // Wait a moment and check if insufficient credits modal appeared after click
+      await projectPage.waitForTimeout(500);
+      await checkAndThrowInsufficientCredits(projectPage);
+
       generateApiResult = await generateApiPromise;
       if (!submitRequestPath && generateApiResult?.requestBody) {
         submitRequestPath = artifactPath(options.artifactsDir, 'canvas-submit-request', 'json');
@@ -2920,6 +3016,14 @@ async function commandCanvasPrompt(args) {
           submitSignal = 'server-accepted-no-record-id';
         }
         break;
+      }
+
+      if (submitState.signal === 'insufficient-credits') {
+        const creditModal = submitState.creditModal;
+        const creditMsg = creditModal?.creditAmount
+          ? `当前积分: ${creditModal.creditAmount}`
+          : '请检查账户积分余额';
+        throw new Error(`积分不足，无法生成内容。${creditMsg}。弹窗提示: "${creditModal?.keyword || '未知'}"`);
       }
 
       if (attempt < submitRetries) {
@@ -3084,9 +3188,17 @@ async function commandGenerate(args) {
         throw new Error(`Could not find a submit button. Inspect ${beforeSnapshot.jsonPath}`);
       }
 
+      // Check for insufficient credits modal before clicking submit
+      await checkAndThrowInsufficientCredits(page);
+
       logStep(`Clicking submit button: ${submitButton.label}`);
       const generateApiPromise = waitForGenerateApiResult(page, Math.min(options.timeoutMs, 30000));
       await submitButton.locator.click();
+
+      // Wait a moment and check if insufficient credits modal appeared after click
+      await page.waitForTimeout(500);
+      await checkAndThrowInsufficientCredits(page);
+
       generateApiResult = await generateApiPromise;
       if (!submitRequestPath && generateApiResult?.requestBody) {
         submitRequestPath = artifactPath(options.artifactsDir, `generate-submit-request-${tool}`, 'json');
@@ -3144,6 +3256,14 @@ async function commandGenerate(args) {
           submitSignal = 'server-accepted-no-record-id';
         }
         break;
+      }
+
+      if (submitState.signal === 'insufficient-credits') {
+        const creditModal = submitState.creditModal;
+        const creditMsg = creditModal?.creditAmount
+          ? `当前积分: ${creditModal.creditAmount}`
+          : '请检查账户积分余额';
+        throw new Error(`积分不足，无法生成内容。${creditMsg}。弹窗提示: "${creditModal?.keyword || '未知'}"`);
       }
 
       if (attempt < submitRetries) {
