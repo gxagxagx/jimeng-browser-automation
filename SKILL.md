@@ -31,7 +31,7 @@ npx playwright install chromium
 - Ensure login before any generate action.
 - Use structured flags for structured choices: `--model`, `--reference-mode`, `--duration`, `--aspect`, `--resolution`, `--reference-file`, `--first-frame-file`, `--last-frame-file`.
 - Keep the prompt focused on content: subject, scene, action, emotion, camera language, style.
-- Do not hide option labels such as `9:16`, `1080P`, `高清 2K`, `Seedance 2.0 Fast`, `主体参考`, or `首尾帧` inside the prompt unless the user literally wants those words in the output.
+- Do not hide option labels such as `9:16`, `1080P`, `高清 2K`, `Seedance 2.0 Fast VIP`, `Seedance 2.0`, or `首尾帧` inside the prompt unless the user literally wants those words in the output.
 - Exception: JiMeng mention tokens are part of the content binding, not normal option flags.
 - Do not guess unavailable options. Use exact visible Chinese labels or omit the flag.
 - Treat the entire `runtime/` directory as private local data. Do not commit it.
@@ -43,7 +43,6 @@ npx playwright install chromium
 - `5 秒视频` -> `--duration 5s`
 - `12 秒视频` -> `--duration 12s`
 - `高清 2K` / `1080P` -> `--resolution ...`
-- `用这张图做主体参考` -> `--reference-mode 主体参考 --reference-file ...`
 - `首尾帧过渡` -> `--reference-mode 首尾帧 --first-frame-file ... --last-frame-file ...`
 
 ## Minimal interface
@@ -190,8 +189,10 @@ Optional:
 
 Observed video options:
 
-- Models: `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
-- Reference modes: `全能参考`, `首尾帧`, `智能多帧`, `主体参考`
+- Models observed live on 2026-04-14 in the default `全能参考` dropdown:
+  `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
+- Supported video models: `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
+- Supported reference modes: `全能参考`, `首尾帧`
 - Durations currently seen: `4s` to `15s`
 - Aspect ratios: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16`
 - Resolutions seen: `720P`, `1080P`
@@ -199,12 +200,12 @@ Observed video options:
 Behavior:
 
 - Usually returns `recordId` on success.
-- Supports pure text, `全能参考`, `主体参考`, `首尾帧`, and `智能多帧`.
+- Supports pure text, `全能参考`, and `首尾帧`.
 - One video task produces `1` MP4.
 - For hot models, inspect `serverAccepted`, `historyRecordId`, `serverRet`, and `serverErrmsg`.
 - JiMeng can accept a task before the history card appears. `serverAccepted=true` with no `recordId` is accepted, not a hard failure.
 - Resolution availability is dynamic. Not every model, aspect ratio, and reference-mode combination exposes the same resolution.
-- For `Seedance 2.0 Fast` and `Seedance 2.0`, prefer:
+- For `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`, prefer:
 
 ```bash
 --submit-retries 2 --submit-retry-delay-ms 60000 --record-id-wait-ms 180000
@@ -260,12 +261,11 @@ node scripts/jimeng-browser.js download-record --record-id <record-id> --wait-co
 
 Choose models from the reference mode first, not the other way around.
 
-Current observed compatibility:
+Current supported note from 2026-04-14:
 
-- `全能参考` -> `Seedance 2.0 Fast`, `Seedance 2.0`
-- `首尾帧` -> `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
-- `智能多帧` -> `视频 3.0 Fast`, `视频 3.0`
-- `主体参考` -> `视频 3.0`
+- Keep video work on `全能参考` and `首尾帧`.
+- Keep model choices on `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`.
+- `主体参考` and older video-model families are removed from supported guidance.
 
 Important:
 
@@ -277,14 +277,11 @@ Important:
 Mention tokens are only for modes that bind uploaded materials through the editor.
 
 - `全能参考`: use `@图片1`, `@图片2`, `@图片3` in upload order.
-- `主体参考`: use `@主体`. If multiple subject images are uploaded, use local syntax `@主体1`, `@主体2` to choose the first and second visible `主体` options deterministically.
-- `智能多帧`: do not rely on prompt mention tokens.
 - `首尾帧`: do not rely on prompt mention tokens. Use `--first-frame-file` and `--last-frame-file`.
 
 Important:
 
 - Plain text `@图片1` is not enough. The automation must select the popup option so JiMeng inserts a real mention tag node.
-- Verified live: `主体参考` submits reach JiMeng as structured reference nodes, not degraded plain text like `让@@`.
 - The same mention insertion logic is also reused inside canvas project prompts when the active project editor supports uploaded-material mentions.
 
 ## Canvas project rules

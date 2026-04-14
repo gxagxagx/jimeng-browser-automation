@@ -74,8 +74,10 @@ Selection rules:
 
 Observed after login:
 
-- Model option prefixes: `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
-- Reference modes: `全能参考`, `首尾帧`, `智能多帧`, `主体参考`
+- Models observed live on 2026-04-14 in the default `全能参考` dropdown:
+  `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
+- Supported video models: `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
+- Supported reference modes: `全能参考`, `首尾帧`
 - Observed durations on the current page: `4s`, `5s`, `6s`, `7s`, `8s`, `9s`, `10s`, `11s`, `12s`, `13s`, `14s`, `15s`
 - Aspect ratios: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16`
 - Resolutions: `720P`, `1080P`
@@ -85,33 +87,27 @@ Selection rules:
 
 - Use exact Chinese labels when setting options.
 - If the user does not require a specific model, duration, aspect ratio, or resolution, omitting that flag is safer than guessing.
-- `全能参考`, `主体参考`, and most `智能多帧` flows use `--reference-file`.
+- `全能参考` uses `--reference-file`.
 - `首尾帧` uses `--first-frame-file` and `--last-frame-file`.
-- For hot `Seedance 2.0 Fast` and `Seedance 2.0` queues, use submit retries and longer wait windows.
+- For hot `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0` queues, use submit retries and longer wait windows.
 - Keep prompts semantic. Put model, duration, aspect ratio, resolution, and reference mode into flags instead of embedding labels such as `9:16`, `1080P`, `12s`, or `首尾帧` into the prompt.
 - Exception for reference-binding modes: prompt mention tokens are part of the content binding and should stay in the prompt.
 - `全能参考` uses numbered material labels such as `@图片1` and `@图片2`.
-- `主体参考` uses the semantic label `@主体`.
-- If multiple subjects are uploaded in `主体参考`, the current picker shows duplicate visible labels `主体`, `主体`. The automation should use local syntax `@主体1`, `@主体2` to select the first and second visible `主体` options.
 - Verified live: when two images are uploaded in `全能参考`, the editor switches from `textarea` to a ProseMirror rich-text editor, and typing `@` opens a picker with `图片1`, `图片2`.
 - Plain text `@图片1` is not enough. The automation must choose the popup option so JiMeng inserts a real mention tag node.
-- Verified live on 2026-03-11: in `主体参考`, the active generator shows the picker label `主体`, and a successful submit with `让@主体...` sent `idip_meta_list = [text, idip_frame, text]` in the generate request payload.
-- Verified live on 2026-03-11: a two-subject `主体参考` submit sent `idip_meta_list = [text, idip_frame(image_idx=0), text, idip_frame(image_idx=1), text]`.
-- `智能多帧` currently does not expose a rich-text mention picker in the active generator. Treat it as frame/timeline driven.
 - `首尾帧` currently uses dedicated first-frame/last-frame uploads plus a plain textarea. Do not rely on prompt mention tokens there.
 - The current editor hint says `上传1-5张参考图或视频`, so the automation should treat multi-file `--reference-file` as a first-class path for `全能参考`.
-- The current page can silently rewrite incompatible model/mode combinations. Verified on 2026-03-11: selecting `视频 3.0 Fast` and then `全能参考` changes the visible model back to `Seedance 2.0 Fast`.
+- The current page can silently rewrite incompatible model/mode combinations. Older `视频 3.x` rewrite observations from 2026-03-11 should be treated as stale until re-verified against the current model list.
 
-Mode-first compatibility observations from 2026-03-11:
+Current supported note from 2026-04-14:
 
-- `全能参考` -> `Seedance 2.0 Fast`, `Seedance 2.0`
-- `首尾帧` -> `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
-- `智能多帧` -> `视频 3.0 Fast`, `视频 3.0`
-- `主体参考` -> `视频 3.0`
+- Keep video work on `全能参考` and `首尾帧`.
+- Keep model choices on `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`.
+- `主体参考` and older video-model families are removed from supported guidance.
 
 Implementation note:
 
-- Model selection must not use substring matching. `Seedance 2.0` must not match `Seedance 2.0 Fast`, and `视频 3.0` must not match `视频 3.0 Fast` or `视频 3.0 Pro`.
+- Model selection must not use substring matching. `Seedance 2.0` must not match `Seedance 2.0 Fast` or `Seedance 2.0 VIP`, and `Seedance 2.0 Fast` must not match `Seedance 2.0 Fast VIP`.
 
 ## Verified behaviors
 
@@ -119,7 +115,6 @@ Implementation note:
 - Text plus reference-image generation works.
 - Image tasks can complete with partial output: some tiles are downloadable while other tiles show `图片生成失败`.
 - Text-only video generation works.
-- Video generation with `主体参考` works.
 - Video generation with `全能参考` works.
 - Video generation with `全能参考` plus two uploaded images and prompt mentions `@图片1` / `@图片2` works.
 - Video generation with `首尾帧` can submit successfully even when the new history card appears late.

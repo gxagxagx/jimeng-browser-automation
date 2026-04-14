@@ -1133,6 +1133,10 @@ function recordHasFinalActionText(record) {
 }
 
 function summarizeImageResultCounts(record, historyEntry) {
+  const historyStatus = Number(historyEntry?.task?.status ?? historyEntry?.status);
+  const historyComplete = historyStatus === 50;
+  const recordComplete = record?.status === '已完成' || recordHasFinalActionText(record);
+  const finalState = historyComplete || recordComplete;
   const historyFinishedCount = Number.isFinite(Number(historyEntry?.finished_image_count))
     ? Number(historyEntry.finished_image_count)
     : null;
@@ -1159,13 +1163,13 @@ function summarizeImageResultCounts(record, historyEntry) {
   }
 
   let failedCount = historyFailedCount;
-  if (failedCount === null && expectedCount !== null && successfulCount !== null) {
+  if (failedCount === null && finalState && expectedCount !== null && successfulCount !== null) {
     failedCount = Math.max(expectedCount - successfulCount, 0);
   } else if (failedCount === null && failedFromText > 0) {
     failedCount = failedFromText;
   }
 
-  if (successfulCount === null && expectedCount !== null && failedCount !== null) {
+  if (successfulCount === null && finalState && expectedCount !== null && failedCount !== null) {
     successfulCount = Math.max(expectedCount - failedCount, 0);
   }
 
@@ -1183,6 +1187,13 @@ function historyEntryFailureMessage(entry) {
     return null;
   }
 
+  const status = Number(entry?.task?.status ?? entry?.status);
+  const tool = inferToolFromHistoryEntry(entry);
+  const inProgressStatuses = new Set([20]);
+  if (tool === 'image') {
+    inProgressStatuses.add(45);
+  }
+
   const candidates = [
     entry.fail_starling_message,
     entry.fail_starling_key,
@@ -1197,8 +1208,7 @@ function historyEntryFailureMessage(entry) {
     return candidates[0];
   }
 
-  const status = Number(entry?.task?.status ?? entry?.status);
-  if (Number.isFinite(status) && ![20, 50].includes(status)) {
+  if (Number.isFinite(status) && !inProgressStatuses.has(status) && status !== 50) {
     return `History status ${status}`;
   }
 
@@ -1212,6 +1222,7 @@ function historyEntryStatusLabel(entry) {
 
   const canceledMessage = normalizeWhitespace(entry?.fail_starling_message || '');
   const status = Number(entry?.task?.status ?? entry?.status);
+  const tool = inferToolFromHistoryEntry(entry);
   if (status === 30 && (canceledMessage.includes('你已取消生成') || canceledMessage.includes('已取消生成'))) {
     return '已取消';
   }
@@ -1230,6 +1241,9 @@ function historyEntryStatusLabel(entry) {
     return '已完成';
   }
   if (status === 20) {
+    return '生成中';
+  }
+  if (tool === 'image' && status === 45) {
     return '生成中';
   }
 
@@ -1969,17 +1983,39 @@ async function findCanvasPromptEditor(page) {
 }
 
 async function renameCanvasProject(page, newName) {
-  const titleTarget = page.locator('input.title-input-BEs0ab').first();
-  if (!(await titleTarget.count().catch(() => 0))) {
+  const resolveTitleInput = async () => {
+    const explicitInput = page.locator('input.title-input-BEs0ab').first();
+    if (await explicitInput.count().catch(() => 0)) {
+      return explicitInput;
+    }
+
+    const headerInputs = page.locator('header input[type="text"], header input:not([type])');
+    const count = await headerInputs.count().catch(() => 0);
+    for (let i = 0; i < count; i += 1) {
+      const current = headerInputs.nth(i);
+      const box = await current.boundingBox().catch(() => null);
+      if (!box || box.width < 40 || box.height < 16) {
+        continue;
+      }
+      if (await isVisible(current)) {
+        return current;
+      }
+    }
+
+    return null;
+  };
+
+  let titleInput = await resolveTitleInput();
+  if (!titleInput) {
     const titleText = page.locator('header').getByText(/\S+/).first();
     if (await titleText.count().catch(() => 0)) {
       await titleText.click({ force: true }).catch(() => null);
       await page.waitForTimeout(300);
     }
+    titleInput = await resolveTitleInput();
   }
 
-  const titleInput = page.locator('input.title-input-BEs0ab').first();
-  if (!(await titleInput.count().catch(() => 0))) {
+  if (!titleInput) {
     throw new Error('Could not find the canvas project title input.');
   }
 
@@ -2003,11 +2039,18 @@ function summarizeCanvasProjectState(bodyText) {
 }
 
 async function getCanvasProjectName(page) {
-  const titleInput = page.locator('input.title-input-BEs0ab').first();
-  if (await titleInput.count().catch(() => 0)) {
-    const value = await titleInput.inputValue().catch(() => '');
-    if (value.trim()) {
-      return value.trim();
+  const titleInputs = [
+    page.locator('input.title-input-BEs0ab').first(),
+    page.locator('header input[type="text"]').first(),
+    page.locator('header input:not([type])').first()
+  ];
+
+  for (const titleInput of titleInputs) {
+    if (await titleInput.count().catch(() => 0)) {
+      const value = await titleInput.inputValue().catch(() => '');
+      if (value.trim()) {
+        return value.trim();
+      }
     }
   }
 
@@ -2357,6 +2400,19 @@ async function findSubmitButton(page) {
       continue;
     }
     return { label: 'submit-button-KJTUYS', locator };
+  }
+
+  const classButtons = scope.locator('button[class*="submit-button"]');
+  const classCount = await classButtons.count().catch(() => 0);
+  for (let i = 0; i < classCount; i += 1) {
+    const locator = classButtons.nth(i);
+    if (!(await isVisible(locator))) {
+      continue;
+    }
+    if (await locator.isDisabled().catch(() => false)) {
+      continue;
+    }
+    return { label: 'submit-button-class-fragment', locator };
   }
 
   for (const label of SUBMIT_LABELS) {
@@ -2718,6 +2774,20 @@ async function commandLogin(args) {
     const result = await ensureLoggedIn(context, options);
     const snapshot = await saveSnapshot(result.homePage, options.artifactsDir, 'logged-in-home');
     logStep(`Saved the post-login home snapshot: ${snapshot.screenshot}`);
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'login',
+      reusedSession: Boolean(result.reusedSession),
+      loginResult: result.loginResult || null,
+      qrScreenshot: result.qrScreenshot || null,
+      popupScreenshot: result.popupScreenshot || null,
+      storageStatePath: result.statePath || null,
+      homeUrl: result.homePage.url(),
+      homeTitle: await result.homePage.title(),
+      screenshot: snapshot.screenshot,
+      snapshotJson: snapshot.jsonPath,
+      snapshotText: snapshot.textPath
+    });
   } finally {
     await context.close();
   }
@@ -2741,6 +2811,16 @@ async function commandSnapshot(args) {
     logStep(`Saved screenshot: ${snapshot.screenshot}`);
     logStep(`Saved JSON snapshot: ${snapshot.jsonPath}`);
     logStep(`Saved body text: ${snapshot.textPath}`);
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'snapshot',
+      tool,
+      url: page.url(),
+      title: await page.title(),
+      screenshot: snapshot.screenshot,
+      snapshotJson: snapshot.jsonPath,
+      snapshotText: snapshot.textPath
+    });
   } finally {
     await context.close();
   }
@@ -2759,6 +2839,13 @@ async function commandOpenTool(args) {
     }
     logStep(`Opened ${tool}. URL: ${page.url()}`);
     logStep(`Page title: ${await page.title()}`);
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'open-tool',
+      tool,
+      url: page.url(),
+      title: await page.title()
+    });
   } finally {
     await context.close();
   }
@@ -3427,6 +3514,13 @@ async function commandListRecords(args) {
 
   if (!entries.length) {
     logStep(`No tracked records matched. Registry: ${options.registryPath}`);
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'list-records',
+      registryPath: options.registryPath,
+      count: 0,
+      entries: []
+    });
     return;
   }
 
@@ -3444,6 +3538,13 @@ async function commandListRecords(args) {
   }
 
   logStep(`Registry: ${options.registryPath}`);
+  maybeEmitJson(args, {
+    ok: true,
+    command: 'list-records',
+    registryPath: options.registryPath,
+    count: entries.length,
+    entries
+  });
 }
 
 async function commandRecordStatus(args) {
@@ -3693,6 +3794,17 @@ async function commandFindRecord(args) {
         logStep(`Found recordId=${target.recordId} via history-api tool=${resolvedTool} status=${historyStatus}`);
         logStep(`History record id: ${historyEntry.history_record_id || historyEntry.task?.history_id || '-'}`);
         logStep(`History JSON: ${historyPath}`);
+        maybeEmitJson(args, {
+          ok: true,
+          command: 'find-record',
+          found: true,
+          source: 'history-api',
+          recordId: target.recordId,
+          tool: resolvedTool,
+          status: historyStatus,
+          historyRecordId: historyEntry.history_record_id || historyEntry.task?.history_id || null,
+          historyPath
+        });
         return;
       }
 
@@ -3702,6 +3814,18 @@ async function commandFindRecord(args) {
       if (loadedCards.length) {
         logStep(`Loaded card ids: ${loadedCards.map((card) => card.recordId).join(', ')}`);
       }
+      maybeEmitJson(args, {
+        ok: true,
+        command: 'find-record',
+        found: false,
+        source: 'none',
+        recordId: target.recordId,
+        toolCandidates,
+        loadedRecordIds: loadedCards.map((card) => card.recordId),
+        screenshot: snapshot.screenshot,
+        snapshotJson: snapshot.jsonPath,
+        snapshotText: snapshot.textPath
+      });
       return;
     }
 
@@ -3712,6 +3836,17 @@ async function commandFindRecord(args) {
     logStep(`Found recordId=${target.recordId} tool=${located.tool} status=${cardStatus || '-'}`);
     logStep(`Card text: ${truncateText(cardText, 200)}`);
     logStep(`Card screenshot: ${screenshot}`);
+    maybeEmitJson(args, {
+      ok: true,
+      command: 'find-record',
+      found: true,
+      source: 'dom',
+      recordId: target.recordId,
+      tool: located.tool,
+      status: cardStatus || null,
+      cardText,
+      screenshot
+    });
   } finally {
     await context.close();
   }
@@ -3927,7 +4062,7 @@ Optional flags:
   --aspect "1:1"
   --resolution "高清 2K"
   --duration "4s"|"5s"|"10s"|"15s"
-  --reference-mode "全能参考"|"首尾帧"|"智能多帧"|"主体参考"
+  --reference-mode "全能参考"|"首尾帧"
   --first-frame-file /abs/path.png
   --last-frame-file /abs/path.png
   --submit-retries 2
@@ -3940,7 +4075,6 @@ Optional flags:
   --output-dir /abs/path
   --reference-file /abs/path[,/abs/path2]
   In 全能参考 mode, uploaded references can be mentioned in --prompt as @图片1, @图片2, @视频1, @音频1
-  In 主体参考 mode, uploaded references can be mentioned as @主体, or as @主体1, @主体2 when multiple subjects are uploaded
   --image-file /abs/path[,/abs/path2]`);
 }
 

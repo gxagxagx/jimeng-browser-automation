@@ -1,6 +1,6 @@
 # JiMeng Browser Automation
 
-Playwright-based browser automation for [JiMeng AI](https://jimeng.jianying.com) (即梦AI), including hot video models such as `Seedance 2.0 Fast` and `Seedance 2.0`, plus canvas project automation.
+Playwright-based browser automation for [JiMeng AI](https://jimeng.jianying.com) (即梦AI), including current Seedance video models such as `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`, plus canvas project automation.
 
 It supports:
 
@@ -19,6 +19,14 @@ This repo is designed for agent use, but it is also usable directly from the com
 ```bash
 npm install
 npx playwright install chromium
+```
+
+Runtime requirement: Node.js `18+`.
+
+Basic smoke check:
+
+```bash
+npm test
 ```
 
 ## Quick start
@@ -154,8 +162,10 @@ Optional flags:
 
 Observed video options:
 
-- Models: `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
-- Reference modes: `全能参考`, `首尾帧`, `智能多帧`, `主体参考`
+- Models observed live on 2026-04-14 in the default `全能参考` dropdown:
+  `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
+- Supported video models: `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
+- Supported reference modes: `全能参考`, `首尾帧`
 - Durations: `4s` to `15s`
 - Aspect ratios: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16`
 - Resolutions seen: `720P`, `1080P`
@@ -166,12 +176,11 @@ One video task produces `1` MP4.
 
 Choose the reference mode first, then choose a model that really works for that mode.
 
-Current observed compatibility:
+Current supported note from 2026-04-14:
 
-- `全能参考` -> `Seedance 2.0 Fast`, `Seedance 2.0`
-- `首尾帧` -> `Seedance 2.0 Fast`, `Seedance 2.0`, `视频 3.5 Pro`, `视频 3.0 Pro`, `视频 3.0 Fast`, `视频 3.0`
-- `智能多帧` -> `视频 3.0 Fast`, `视频 3.0`
-- `主体参考` -> `视频 3.0`
+- Keep video work on `全能参考` and `首尾帧`.
+- Keep model choices on `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`.
+- `主体参考` and older video-model families are removed from supported guidance.
 
 The site can silently rewrite unsupported combinations. The script re-checks the final visible selection and fails fast on mismatch.
 
@@ -184,7 +193,7 @@ Good examples:
 - `竖屏` -> `--aspect 9:16`
 - `12 秒视频` -> `--duration 12s`
 - `1080P` -> `--resolution 1080P`
-- `主体参考` -> `--reference-mode 主体参考`
+- `首尾帧过渡` -> `--reference-mode 首尾帧`
 
 Keep the prompt focused on content:
 
@@ -201,10 +210,7 @@ Keep the prompt focused on content:
 Some video modes use JiMeng mention tokens inside the prompt to bind uploaded materials.
 
 - `全能参考`: use `@图片1`, `@图片2`, `@图片3` in upload order
-- `主体参考`: use `@主体`
-- multiple subject images in `主体参考`: use local syntax `@主体1`, `@主体2`
 - `首尾帧`: do not use prompt mentions; use `--first-frame-file` and `--last-frame-file`
-- `智能多帧`: do not rely on prompt mention tokens
 
 Important: plain text like `@图片1` is not enough by itself. The script converts these tokens into real JiMeng mention tags before submit.
 
@@ -238,7 +244,7 @@ Observed project flow:
 
 ## High-traffic Seedance behavior
 
-Hot models such as `Seedance 2.0 Fast` and `Seedance 2.0` can be queue-heavy or temporarily reject new submits.
+Hot models such as `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0` can be queue-heavy or temporarily reject new submits.
 
 Recommended retry settings:
 

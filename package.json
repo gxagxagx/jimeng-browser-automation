@@ -3,13 +3,25 @@
   "private": true,
   "version": "0.1.0",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "login": "node scripts/jimeng-browser.js login",
     "snapshot": "node scripts/jimeng-browser.js snapshot",
     "open-tool": "node scripts/jimeng-browser.js open-tool",
+    "canvas-create-project": "node scripts/jimeng-browser.js canvas-create-project",
+    "canvas-open-project": "node scripts/jimeng-browser.js canvas-open-project",
+    "canvas-rename-project": "node scripts/jimeng-browser.js canvas-rename-project",
+    "canvas-prompt": "node scripts/jimeng-browser.js canvas-prompt",
     "generate": "node scripts/jimeng-browser.js generate",
+    "list-records": "node scripts/jimeng-browser.js list-records",
+    "find-record": "node scripts/jimeng-browser.js find-record",
     "record-status": "node scripts/jimeng-browser.js record-status",
-    "download-record": "node scripts/jimeng-browser.js download-record"
+    "cancel-record": "node scripts/jimeng-browser.js cancel-record",
+    "download-record": "node scripts/jimeng-browser.js download-record",
+    "help": "node scripts/jimeng-browser.js --help",
+    "test": "node --check scripts/jimeng-browser.js && node scripts/jimeng-browser.js --help > /dev/null"
   },
   "dependencies": {
     "playwright": "^1.58.2"
