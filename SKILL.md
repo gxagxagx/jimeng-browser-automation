@@ -115,7 +115,14 @@ node scripts/jimeng-browser.js canvas-prompt --project-id 123456 --kind image --
 Optional:
 
 - `--kind image|video|auto`
+- `--model`
+- `--aspect`
+- `--resolution` (image only: `高清 2K`, `超清 4K`)
+- `--duration` (video only: `4s` to `15s`)
+- `--reference-mode` (video only: `全能参考`, `首尾帧`)
 - `--reference-file /absolute/path[,/absolute/path2]`
+- `--first-frame-file /absolute/path`
+- `--last-frame-file /absolute/path`
 - `--project-name`
 - `--project-id`
 - `--project-url`
@@ -189,13 +196,13 @@ Optional:
 
 Observed video options:
 
-- Models observed live on 2026-04-14 in the default `全能参考` dropdown:
+- Models observed live on 2026-04-15 in the default `全能参考` dropdown:
   `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
 - Supported video models: `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
 - Supported reference modes: `全能参考`, `首尾帧`
 - Durations currently seen: `4s` to `15s`
 - Aspect ratios: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16`
-- Resolutions seen: `720P`, `1080P`
+- Resolutions: none (no resolution selector for video)
 
 Behavior:
 
@@ -261,7 +268,7 @@ node scripts/jimeng-browser.js download-record --record-id <record-id> --wait-co
 
 Choose models from the reference mode first, not the other way around.
 
-Current supported note from 2026-04-14:
+Current supported note from 2026-04-15:
 
 - Keep video work on `全能参考` and `首尾帧`.
 - Keep model choices on `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`.

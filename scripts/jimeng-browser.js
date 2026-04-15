@@ -173,6 +173,7 @@ function parseCommonOptions(args) {
   ensureDir(RUNTIME_DIR);
   return {
     artifactsDir,
+    debugArtifacts: boolFlag(args['debug-artifacts'], false),
     registryPath,
     userDataDir,
     headless: boolFlag(args.headless, true),
@@ -1674,6 +1675,13 @@ async function saveSnapshot(page, artifactsDir, label) {
   return { screenshot, jsonPath, textPath };
 }
 
+async function maybeSaveSnapshot(page, options, label) {
+  if (!options.debugArtifacts) {
+    return null;
+  }
+  return saveSnapshot(page, options.artifactsDir, label);
+}
+
 async function findQrImage(popup) {
   const images = popup.locator('img');
   const count = await images.count();
@@ -2178,6 +2186,41 @@ function tokenizeReferencePrompt(prompt) {
   return tokens.length ? tokens : [{ type: 'text', value: String(prompt) }];
 }
 
+function getReferenceMentionPlan(tool, prompt, args = {}) {
+  const promptText = String(prompt || '');
+  const genericReferenceInput = args['reference-file'] || args['image-file'];
+  const hasGenericReference = Boolean(genericReferenceInput);
+
+  if (tool === 'video') {
+    const promptHasReferenceMentions = /@主体\d*|@(图片|视频|音频)\d+/.test(promptText);
+    const needsReferenceMentions = hasGenericReference && promptHasReferenceMentions;
+    return {
+      genericReferenceInput,
+      uploadRequested: Boolean(genericReferenceInput || args['first-frame-file'] || args['last-frame-file']),
+      uploadBeforePrompt: needsReferenceMentions,
+      needsReferenceMentions
+    };
+  }
+
+  if (tool === 'image') {
+    const promptHasImageMentions = /@图片\d+/.test(promptText);
+    const needsReferenceMentions = hasGenericReference && promptHasImageMentions;
+    return {
+      genericReferenceInput,
+      uploadRequested: hasGenericReference,
+      uploadBeforePrompt: needsReferenceMentions,
+      needsReferenceMentions
+    };
+  }
+
+  return {
+    genericReferenceInput,
+    uploadRequested: hasGenericReference,
+    uploadBeforePrompt: false,
+    needsReferenceMentions: false
+  };
+}
+
 async function editorIsEffectivelyEmpty(locator) {
   return locator.evaluate((node) => {
     const text = (node.innerText || '').trim();
@@ -2460,7 +2503,7 @@ async function chooseSelectOption(page, selectIndex, optionText) {
   }
 
   const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
-  const selects = scope.locator('.lv-select[role="combobox"]');
+  const selects = scope.locator('.lv-select[role="combobox"], [role="combobox"]');
   const visibleSelects = [];
   const selectCount = await selects.count();
   for (let i = 0; i < selectCount; i += 1) {
@@ -2472,37 +2515,61 @@ async function chooseSelectOption(page, selectIndex, optionText) {
     if (!(await isVisible(current))) {
       continue;
     }
-    visibleSelects.push(current);
+    const text = normalizeWhitespace(await current.innerText().catch(() => ''));
+    visibleSelects.push({ locator: current, text });
   }
 
-  const select = visibleSelects[selectIndex];
-  if (!select) {
+  if (!visibleSelects.length) {
     throw new Error(`Could not find select index ${selectIndex} for option ${optionText}.`);
   }
 
-  await select.click({ force: true });
-  await page.waitForTimeout(400);
+  if (visibleSelects.some((item) => item.text === optionText)) {
+    return true;
+  }
 
-  const popupOptions = page.locator('.lv-select-popup [role="option"]');
-  const optionCount = await popupOptions.count();
-  let option = null;
-  for (let i = 0; i < optionCount; i += 1) {
-    const current = popupOptions.nth(i);
-    const text = (await current.innerText().catch(() => '')).trim();
-    const firstLine = text.split('\n')[0].trim();
-    if (text === optionText || firstLine === optionText) {
-      option = current;
-      break;
+  const orderedSelects = visibleSelects
+    .map((item, index) => ({ ...item, index }))
+    .sort((a, b) => {
+      const aRank = a.index === selectIndex ? -1 : a.index;
+      const bRank = b.index === selectIndex ? -1 : b.index;
+      return aRank - bRank;
+    });
+
+  for (const select of orderedSelects) {
+    const popupOpened = await openSelectPopup(page, select.locator);
+    if (!popupOpened) {
+      continue;
     }
+
+    const popupOptions = getSelectPopupOptions(page);
+    const optionCount = await popupOptions.count().catch(() => 0);
+    let option = null;
+    for (let i = 0; i < optionCount; i += 1) {
+      const current = popupOptions.nth(i);
+      const text = normalizeWhitespace(await current.innerText().catch(() => ''));
+      const firstLine = text.split('\n')[0].trim();
+      if (text === optionText || firstLine === optionText) {
+        option = current;
+        break;
+      }
+    }
+
+    if (!option) {
+      option = page.locator('.lv-select-popup').getByText(optionText, { exact: true }).last();
+      if (!(await option.count().catch(() => 0))) {
+        await page.keyboard.press('Escape').catch(() => null);
+        await page.waitForTimeout(200);
+        continue;
+      }
+    }
+
+    await option.evaluate((node) => node.click()).catch(() => null);
+    await option.click({ force: true }).catch(() => null);
+    await page.waitForTimeout(500);
+    return true;
   }
 
-  if (!option || !(await isVisible(option))) {
-    throw new Error(`Could not find select option: ${optionText}`);
-  }
-
-  await option.click({ force: true });
-  await page.waitForTimeout(500);
-  return true;
+  throw new Error(`Could not find select option: ${optionText}`);
 }
 
 async function chooseVisibleSelectOption(page, optionText, matchText = null) {
@@ -2535,20 +2602,58 @@ async function chooseVisibleSelectOption(page, optionText, matchText = null) {
     return false;
   }
 
-  await resolvedTarget.locator.evaluate((node) => node.click()).catch(() => null);
-  await page.waitForTimeout(300);
+  const popupOpened = await openSelectPopup(page, resolvedTarget.locator);
+  if (!popupOpened) {
+    return false;
+  }
 
-  const options = page.locator('.lv-select-option');
+  const options = getSelectPopupOptions(page);
   const optionCount = await options.count().catch(() => 0);
   for (let i = 0; i < optionCount; i += 1) {
     const current = options.nth(i);
     const text = normalizeWhitespace(await current.innerText().catch(() => ''));
-    if (text !== optionText) {
+    const firstLine = text.split('\n')[0].trim();
+    if (text !== optionText && firstLine !== optionText) {
       continue;
     }
     await current.evaluate((node) => node.click()).catch(() => null);
     await page.waitForTimeout(500);
     return true;
+  }
+
+  return false;
+}
+
+function getSelectPopupOptions(page) {
+  return page.locator('.lv-select-popup [role="option"], .lv-select-popup .lv-select-option, [role="option"]');
+}
+
+async function hasVisibleSelectPopup(page) {
+  const popup = page.locator('.lv-select-popup').last();
+  if (!(await popup.count().catch(() => 0))) {
+    return false;
+  }
+  return popup.isVisible().catch(() => false);
+}
+
+async function openSelectPopup(page, locator) {
+  const attempts = [
+    async () => locator.click({ force: true }).catch(() => null),
+    async () => locator.evaluate((node) => node.click()).catch(() => null),
+    async () => {
+      await locator.focus().catch(() => null);
+      await page.keyboard.press('Enter').catch(() => null);
+    }
+  ];
+
+  for (const attempt of attempts) {
+    await page.keyboard.press('Escape').catch(() => null);
+    await page.waitForTimeout(150);
+    await attempt();
+    await page.waitForTimeout(400);
+    if (await hasVisibleSelectPopup(page)) {
+      return true;
+    }
   }
 
   return false;
@@ -2605,10 +2710,28 @@ async function verifyVideoOptionSelections(page, args) {
 async function chooseToolbarOption(page, groupRole, optionText) {
   const groups = page.locator(`.lv-popover-content [role="${groupRole}"]`);
   const groupCount = await groups.count();
+  const normalizedTarget = optionText.toLowerCase().replace(/\s+/g, '');
+
   for (let i = 0; i < groupCount; i += 1) {
-    const option = groups.nth(i).locator('label').filter({ hasText: optionText }).first();
-    if (await isVisible(option)) {
-      await option.click({ force: true });
+    const group = groups.nth(i);
+    const options = group.locator('label, .lv-radio, [role="radio"], button');
+    const optionCount = await options.count().catch(() => 0);
+    for (let j = 0; j < optionCount; j += 1) {
+      const option = options.nth(j);
+      if (!(await isVisible(option))) {
+        continue;
+      }
+      const text = normalizeWhitespace(await option.innerText().catch(() => ''));
+      // Also check any radio input value inside this option
+      const radioValue = await option.locator('input[type="radio"]').first()
+        .getAttribute('value').catch(() => '') || '';
+      const normalizedText = text.toLowerCase().replace(/\s+/g, '');
+      const normalizedValue = radioValue.toLowerCase().replace(/\s+/g, '');
+      if (text !== optionText && normalizedText !== normalizedTarget && normalizedValue !== normalizedTarget) {
+        continue;
+      }
+      await option.click({ force: true }).catch(() => null);
+      await option.evaluate((node) => node.click()).catch(() => null);
       await page.waitForTimeout(300);
       return true;
     }
@@ -2634,13 +2757,36 @@ async function configureAspectResolution(page, args, labelPrefix) {
   }
 
   const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
-  const toolbarButton = scope.locator('button[class*="toolbar-button-"]').first();
-  if (!(await isVisible(toolbarButton))) {
-    throw new Error(`Could not find the ${labelPrefix} aspect/resolution toolbar button.`);
+  const toolbarButtons = scope.locator('button[class*="toolbar-button-"]');
+  const visibleButtons = [];
+  const buttonCount = await toolbarButtons.count().catch(() => 0);
+  for (let i = 0; i < buttonCount; i += 1) {
+    const current = toolbarButtons.nth(i);
+    const box = await current.boundingBox().catch(() => null);
+    if (!box || box.width < 20 || box.height < 20) {
+      continue;
+    }
+    if (!(await isVisible(current))) {
+      continue;
+    }
+    visibleButtons.push(current);
   }
 
-  await toolbarButton.click({ force: true });
-  await page.waitForTimeout(400);
+  let toolbarOpened = false;
+  for (const button of visibleButtons) {
+    await button.click({ force: true }).catch(() => null);
+    await button.evaluate((node) => node.click()).catch(() => null);
+    await page.waitForTimeout(400);
+    const groups = page.locator('.lv-popover-content [role="radiogroup"]');
+    if ((await groups.count().catch(() => 0)) > 0) {
+      toolbarOpened = true;
+      break;
+    }
+  }
+
+  if (!toolbarOpened) {
+    throw new Error(`Could not find the ${labelPrefix} aspect/resolution toolbar button.`);
+  }
 
   if (args.aspect) {
     const aspectChosen = await chooseToolbarOption(page, 'radiogroup', args.aspect);
@@ -2690,19 +2836,71 @@ async function selectCanvasConversationTool(page, tool) {
     return false;
   }
 
-  const chosen = await chooseVisibleSelectOption(page, label, '模式');
-  if (chosen) {
-    await page.waitForTimeout(800);
+  // If already in the right tool state, skip switching
+  const alreadyReady = await waitForCanvasConversationTool(page, tool, 2000);
+  if (alreadyReady) {
     return true;
   }
 
-  const fallbackChosen = await chooseVisibleSelectOption(page, label, 'Agent');
-  if (fallbackChosen) {
+  // Try to find the combobox regardless of its current text (Agent 模式, 图片生成, etc.)
+  const chosen = await chooseVisibleSelectOption(page, label, null);
+  if (chosen) {
     await page.waitForTimeout(800);
+    const confirmed = await waitForCanvasConversationTool(page, tool);
+    if (!confirmed) {
+      throw new Error(`The canvas conversation tool did not switch to ${label}.`);
+    }
     return true;
   }
 
   throw new Error(`Could not switch the canvas conversation tool to ${label}.`);
+}
+
+async function waitForCanvasConversationTool(page, tool, timeoutMs = 10000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+    const text = normalizeWhitespace(await scope.innerText().catch(() => ''));
+
+    // Also check data-placeholder attributes on editors inside scope
+    const editors = scope.locator('[role="textbox"]');
+    const editorCount = await editors.count().catch(() => 0);
+    let placeholderText = '';
+    for (let i = 0; i < editorCount; i += 1) {
+      const ph = await editors.nth(i).getAttribute('data-placeholder').catch(() => '');
+      if (ph) {
+        placeholderText += ph;
+      }
+    }
+
+    // Also check combobox current value to confirm tool switched
+    const combo = scope.locator('.lv-select[role="combobox"]').first();
+    const comboText = normalizeWhitespace(await combo.innerText().catch(() => ''));
+
+    if (tool === 'image') {
+      if (
+        text.includes('描述你想生成的图片') ||
+        placeholderText.includes('描述你想生成的图片') ||
+        text.includes('上传参考图') ||
+        placeholderText.includes('上传参考图') ||
+        comboText === '图片生成'
+      ) {
+        return true;
+      }
+    }
+    if (tool === 'video') {
+      if (
+        text.includes('Seedance') ||
+        text.includes('上传参考、输入文字') ||
+        placeholderText.includes('上传') ||
+        comboText === '视频生成'
+      ) {
+        return true;
+      }
+    }
+    await page.waitForTimeout(400);
+  }
+  return false;
 }
 
 function createTrackedRecordEntry(args, tool, prompt, recordCard) {
@@ -2785,8 +2983,10 @@ async function commandLogin(args) {
 
   try {
     const result = await ensureLoggedIn(context, options);
-    const snapshot = await saveSnapshot(result.homePage, options.artifactsDir, 'logged-in-home');
-    logStep(`Saved the post-login home snapshot: ${snapshot.screenshot}`);
+    const snapshot = await maybeSaveSnapshot(result.homePage, options, 'logged-in-home');
+    if (snapshot) {
+      logStep(`Saved the post-login home snapshot: ${snapshot.screenshot}`);
+    }
     maybeEmitJson(args, {
       ok: true,
       command: 'login',
@@ -2797,9 +2997,9 @@ async function commandLogin(args) {
       storageStatePath: result.statePath || null,
       homeUrl: result.homePage.url(),
       homeTitle: await result.homePage.title(),
-      screenshot: snapshot.screenshot,
-      snapshotJson: snapshot.jsonPath,
-      snapshotText: snapshot.textPath
+      screenshot: snapshot?.screenshot || null,
+      snapshotJson: snapshot?.jsonPath || null,
+      snapshotText: snapshot?.textPath || null
     });
   } finally {
     await context.close();
@@ -2877,9 +3077,11 @@ async function commandCanvasCreateProject(args) {
 
     const projectPage = await createCanvasProjectFromHome(page, context, options.timeoutMs);
     const projectId = extractCanvasProjectId(projectPage.url());
-    const snapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-create-project');
+    const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-create-project');
     logStep(`Created a new canvas project window. URL: ${projectPage.url()}`);
-    logStep(`Saved canvas project snapshot: ${snapshot.screenshot}`);
+    if (snapshot) {
+      logStep(`Saved canvas project snapshot: ${snapshot.screenshot}`);
+    }
 
     maybeEmitJson(args, {
       ok: true,
@@ -2888,9 +3090,9 @@ async function commandCanvasCreateProject(args) {
       projectUrl: projectPage.url(),
       projectTitle: await projectPage.title(),
       projectName: await getCanvasProjectName(projectPage),
-      screenshot: snapshot.screenshot,
-      snapshotJson: snapshot.jsonPath,
-      snapshotText: snapshot.textPath
+      screenshot: snapshot?.screenshot || null,
+      snapshotJson: snapshot?.jsonPath || null,
+      snapshotText: snapshot?.textPath || null
     });
   } finally {
     await context.close();
@@ -2926,7 +3128,7 @@ async function commandCanvasOpenProject(args) {
     }
 
     const projectId = extractCanvasProjectId(projectPage.url());
-    const snapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-open-project');
+    const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-open-project');
     logStep(`Opened canvas project. URL: ${projectPage.url()}`);
 
     maybeEmitJson(args, {
@@ -2936,9 +3138,9 @@ async function commandCanvasOpenProject(args) {
       projectUrl: projectPage.url(),
       projectTitle: await projectPage.title(),
       projectName: await getCanvasProjectName(projectPage),
-      screenshot: snapshot.screenshot,
-      snapshotJson: snapshot.jsonPath,
-      snapshotText: snapshot.textPath
+      screenshot: snapshot?.screenshot || null,
+      snapshotJson: snapshot?.jsonPath || null,
+      snapshotText: snapshot?.textPath || null
     });
   } finally {
     await context.close();
@@ -2962,7 +3164,7 @@ async function commandCanvasRenameProject(args) {
     }
 
     await renameCanvasProject(projectPage, newName);
-    const snapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-rename-project');
+    const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-rename-project');
     const projectId = extractCanvasProjectId(projectPage.url());
     logStep(`Renamed canvas project to: ${newName}`);
 
@@ -2974,9 +3176,9 @@ async function commandCanvasRenameProject(args) {
       projectTitle: await projectPage.title(),
       projectName: await getCanvasProjectName(projectPage),
       name: newName,
-      screenshot: snapshot.screenshot,
-      snapshotJson: snapshot.jsonPath,
-      snapshotText: snapshot.textPath
+      screenshot: snapshot?.screenshot || null,
+      snapshotJson: snapshot?.jsonPath || null,
+      snapshotText: snapshot?.textPath || null
     });
   } finally {
     await context.close();
@@ -3028,22 +3230,22 @@ async function commandCanvasPrompt(args) {
       }
     }
 
-    const genericReferenceInput = args['reference-file'] || args['image-file'];
-    const needsReferenceMentions = /@主体\d*|@(图片|视频|音频)\d+/.test(composedPrompt);
-    const uploadRequested = resolvedTool === 'video'
-      ? Boolean(genericReferenceInput || args['first-frame-file'] || args['last-frame-file'])
-      : Boolean(genericReferenceInput);
-    const uploadBeforePrompt = resolvedTool === 'video'
-      && Boolean(genericReferenceInput)
-      && needsReferenceMentions;
+    const {
+      genericReferenceInput,
+      uploadRequested,
+      uploadBeforePrompt,
+      needsReferenceMentions
+    } = getReferenceMentionPlan(resolvedTool, composedPrompt, args);
     let uploadWorked = false;
 
     if (uploadBeforePrompt) {
-      uploadWorked = await maybeUploadVideoReferences(projectPage, args);
+      uploadWorked = resolvedTool === 'video'
+        ? await maybeUploadVideoReferences(projectPage, args)
+        : await maybeUploadImage(projectPage, genericReferenceInput);
       if (needsReferenceMentions && !uploadWorked) {
-        throw new Error('Could not upload the canvas video reference files before inserting @ mentions.');
+        throw new Error(`Could not upload the canvas ${resolvedTool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
       }
-      if (uploadWorked) {
+      if (uploadWorked && resolvedTool === 'video') {
         await waitForVideoReferenceEditorReady(projectPage, 10000);
       }
       if (uploadWorked && needsReferenceMentions) {
@@ -3051,7 +3253,10 @@ async function commandCanvasPrompt(args) {
       }
       target = await ensureCanvasConversationOpen(projectPage);
       if (!target) {
-        throw new Error('Could not find the canvas project conversation editor after video reference upload.');
+        throw new Error(`Could not find the canvas project conversation editor after ${resolvedTool === 'video' ? 'video reference' : 'reference image'} upload.`);
+      }
+      if (needsReferenceMentions && target.type !== 'editor') {
+        throw new Error('Could not find the canvas rich-text editor needed for @ mentions.');
       }
     }
 
@@ -3092,7 +3297,7 @@ async function commandCanvasPrompt(args) {
     for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
       attemptCount = attempt + 1;
       const previousRecordIds = new Set((await collectLoadedRecordCards(projectPage)).map((card) => card.recordId));
-      beforeSnapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-before-submit');
+      beforeSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-before-submit');
 
       // Check for insufficient credits modal before clicking submit
       await checkAndThrowInsufficientCredits(projectPage);
@@ -3141,7 +3346,7 @@ async function commandCanvasPrompt(args) {
         timeoutMs: Math.min(options.timeoutMs, resolvedTool === 'video' ? 30000 : 20000)
       });
       await projectPage.waitForTimeout(integerFlag(args['wait-after-submit-ms'], 8000));
-      afterSnapshot = await saveSnapshot(projectPage, options.artifactsDir, 'canvas-after-submit');
+      afterSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-after-submit');
 
       if (submitState.recordCard) {
         trackedRecord = {
@@ -3269,23 +3474,22 @@ async function commandGenerate(args) {
       await configureVideoOptions(page, args);
     }
 
-    const genericReferenceInput = args['reference-file'] || args['image-file'];
-    const promptHasReferenceMentions = /@主体\d*|@(图片|视频|音频)\d+/.test(prompt);
-    const uploadRequested = tool === 'video'
-      ? Boolean(genericReferenceInput || args['first-frame-file'] || args['last-frame-file'])
-      : Boolean(genericReferenceInput);
-    const uploadBeforePrompt = tool === 'video'
-      && Boolean(genericReferenceInput)
-      && promptHasReferenceMentions;
-    const needsReferenceMentions = uploadBeforePrompt;
+    const {
+      genericReferenceInput,
+      uploadRequested,
+      uploadBeforePrompt,
+      needsReferenceMentions
+    } = getReferenceMentionPlan(tool, prompt, args);
     let uploadWorked = false;
 
     if (uploadBeforePrompt) {
-      uploadWorked = await maybeUploadVideoReferences(page, args);
+      uploadWorked = tool === 'video'
+        ? await maybeUploadVideoReferences(page, args)
+        : await maybeUploadImage(page, genericReferenceInput);
       if (needsReferenceMentions && !uploadWorked) {
-        throw new Error('Could not upload the video reference files before inserting @ mentions.');
+        throw new Error(`Could not upload the ${tool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
       }
-      if (uploadWorked) {
+      if (uploadWorked && tool === 'video') {
         await waitForVideoReferenceEditorReady(page, 10000);
       }
       if (uploadWorked && needsReferenceMentions) {
@@ -3296,12 +3500,12 @@ async function commandGenerate(args) {
     const activeScope = await getActiveGeneratorRoot(page).catch(() => null) || page;
     let promptTarget = await findPromptTarget(page, { preferRichEditor: uploadBeforePrompt, scope: activeScope });
     if (!promptTarget) {
-      const snapshot = await saveSnapshot(page, options.artifactsDir, `generate-missing-prompt-${tool}`);
-      throw new Error(`Could not find a visible prompt field. Inspect ${snapshot.jsonPath}`);
+      const snapshot = await maybeSaveSnapshot(page, options, `generate-missing-prompt-${tool}`);
+      throw new Error(`Could not find a visible prompt field.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
     }
     if (needsReferenceMentions && promptTarget.type !== 'editor') {
-      const snapshot = await saveSnapshot(page, options.artifactsDir, `generate-missing-mention-editor-${tool}`);
-      throw new Error(`Could not find the video rich-text editor needed for @ mentions. Inspect ${snapshot.jsonPath}`);
+      const snapshot = await maybeSaveSnapshot(page, options, `generate-missing-mention-editor-${tool}`);
+      throw new Error(`Could not find the rich-text editor needed for @ mentions.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
     }
 
     await fillPrompt(promptTarget, prompt, {
@@ -3339,10 +3543,10 @@ async function commandGenerate(args) {
     for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
       attemptCount = attempt + 1;
       const previousRecordIds = new Set((await collectLoadedRecordCards(page)).map((card) => card.recordId));
-      beforeSnapshot = await saveSnapshot(page, options.artifactsDir, `generate-before-submit-${tool}`);
+      beforeSnapshot = await maybeSaveSnapshot(page, options, `generate-before-submit-${tool}`);
       const submitButton = await findSubmitButton(page);
       if (!submitButton) {
-        throw new Error(`Could not find a submit button. Inspect ${beforeSnapshot.jsonPath}`);
+        throw new Error(`Could not find a submit button.${beforeSnapshot ? ` Inspect ${beforeSnapshot.jsonPath}` : ''}`);
       }
 
       // Check for insufficient credits modal before clicking submit
@@ -3393,7 +3597,7 @@ async function commandGenerate(args) {
         timeoutMs: Math.min(options.timeoutMs, tool === 'video' ? 30000 : 20000)
       });
       await page.waitForTimeout(2000);
-      afterSnapshot = await saveSnapshot(page, options.artifactsDir, `generate-after-submit-${tool}`);
+      afterSnapshot = await maybeSaveSnapshot(page, options, `generate-after-submit-${tool}`);
 
       if (submitState.recordCard) {
         trackedRecord = submitState.recordCard;
@@ -3601,8 +3805,8 @@ async function commandRecordStatus(args) {
     const tool = inferToolFromHistoryEntry(historyEntry) || located.tool;
 
     if (!located.record && !historyEntry) {
-      const snapshot = await saveSnapshot(page, options.artifactsDir, `record-status-${safeSlug(target.recordId)}`);
-      throw new Error(`Could not find record ${target.recordId}. Inspect ${snapshot.jsonPath}`);
+      const snapshot = await maybeSaveSnapshot(page, options, `record-status-${safeSlug(target.recordId)}`);
+      throw new Error(`Could not find record ${target.recordId}.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
     }
 
     const summary = summarizeRecordStatus(target.recordId, tool, located.record, historyEntry);
@@ -3683,8 +3887,8 @@ async function commandCancelRecord(args) {
     }
 
     if (!historyEntry) {
-      const snapshot = await saveSnapshot(page, options.artifactsDir, `cancel-record-${safeSlug(target.recordId)}`);
-      throw new Error(`Could not load history details for ${target.recordId}. Inspect ${snapshot.jsonPath}`);
+      const snapshot = await maybeSaveSnapshot(page, options, `cancel-record-${safeSlug(target.recordId)}`);
+      throw new Error(`Could not load history details for ${target.recordId}.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
     }
 
     const beforeSummary = summarizeRecordStatus(target.recordId, tool, located.record, historyEntry);
@@ -3822,8 +4026,8 @@ async function commandFindRecord(args) {
       }
 
       const loadedCards = await collectLoadedRecordCards(page, 20);
-      const snapshot = await saveSnapshot(page, options.artifactsDir, `find-record-${safeSlug(target.recordId)}`);
-      logStep(`Record ${target.recordId} was not found on tools ${toolCandidates.join(', ')}. Saved snapshot: ${snapshot.screenshot}`);
+      const snapshot = await maybeSaveSnapshot(page, options, `find-record-${safeSlug(target.recordId)}`);
+      logStep(`Record ${target.recordId} was not found on tools ${toolCandidates.join(', ')}.${snapshot ? ` Saved snapshot: ${snapshot.screenshot}` : ''}`);
       if (loadedCards.length) {
         logStep(`Loaded card ids: ${loadedCards.map((card) => card.recordId).join(', ')}`);
       }
@@ -3835,9 +4039,9 @@ async function commandFindRecord(args) {
         recordId: target.recordId,
         toolCandidates,
         loadedRecordIds: loadedCards.map((card) => card.recordId),
-        screenshot: snapshot.screenshot,
-        snapshotJson: snapshot.jsonPath,
-        snapshotText: snapshot.textPath
+        screenshot: snapshot?.screenshot || null,
+        snapshotJson: snapshot?.jsonPath || null,
+        snapshotText: snapshot?.textPath || null
       });
       return;
     }
@@ -3934,8 +4138,8 @@ async function commandDownloadRecord(args) {
     }
 
     if (!record && !historyEntry) {
-      const snapshot = await saveSnapshot(page, options.artifactsDir, `download-record-${safeSlug(target.recordId)}`);
-      throw new Error(`Could not find a complete record for ${target.recordId}. Inspect ${snapshot.jsonPath}`);
+      const snapshot = await maybeSaveSnapshot(page, options, `download-record-${safeSlug(target.recordId)}`);
+      throw new Error(`Could not find a complete record for ${target.recordId}.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
     }
 
     const domComplete = recordIsComplete(record, tool);
@@ -4063,6 +4267,7 @@ Optional flags:
   --registry-path /abs/path.jsonl
   --headless true|false
   --json true|false
+  --debug-artifacts true|false
   --timeout-ms 180000
   --project-name "未命名项目"
   --project-index 1

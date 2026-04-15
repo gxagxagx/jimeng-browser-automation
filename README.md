@@ -162,13 +162,13 @@ Optional flags:
 
 Observed video options:
 
-- Models observed live on 2026-04-14 in the default `全能参考` dropdown:
+- Models observed live on 2026-04-15 in the default `全能参考` dropdown:
   `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
 - Supported video models: `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, `Seedance 2.0`
 - Supported reference modes: `全能参考`, `首尾帧`
 - Durations: `4s` to `15s`
 - Aspect ratios: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16`
-- Resolutions seen: `720P`, `1080P`
+- Resolutions: none (no resolution selector for video)
 
 One video task produces `1` MP4.
 
@@ -176,7 +176,7 @@ One video task produces `1` MP4.
 
 Choose the reference mode first, then choose a model that really works for that mode.
 
-Current supported note from 2026-04-14:
+Current supported note from 2026-04-15:
 
 - Keep video work on `全能参考` and `首尾帧`.
 - Keep model choices on `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`.
