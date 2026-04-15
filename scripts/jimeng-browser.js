@@ -288,7 +288,7 @@ async function openGeneratorFromHome(page, tool) {
 }
 
 async function getActiveGeneratorRoot(page) {
-  const buttons = page.locator('button.submit-button-KJTUYS');
+  const buttons = page.locator('button[class*="submit-button-"]');
   let best = null;
   const buttonCount = await buttons.count();
 
@@ -303,7 +303,7 @@ async function getActiveGeneratorRoot(page) {
       continue;
     }
 
-    const root = button.locator('xpath=ancestor::div[contains(@class,"dimension-layout-FUl4Nj") and contains(@class,"default-layout-bOIxyJ")][1]');
+    const root = button.locator('xpath=ancestor::div[contains(@class,"dimension-layout-") and contains(@class,"default-layout-")][1]');
     if (!(await root.count().catch(() => 0))) {
       continue;
     }
@@ -317,7 +317,7 @@ async function getActiveGeneratorRoot(page) {
     return best.root;
   }
 
-  const roots = page.locator('.dimension-layout-FUl4Nj.default-layout-bOIxyJ');
+  const roots = page.locator('[class*="dimension-layout-"][class*="default-layout-"]');
   let fallback = null;
   const rootCount = await roots.count();
   for (let i = 0; i < rootCount; i += 1) {
@@ -1188,11 +1188,7 @@ function historyEntryFailureMessage(entry) {
   }
 
   const status = Number(entry?.task?.status ?? entry?.status);
-  const tool = inferToolFromHistoryEntry(entry);
-  const inProgressStatuses = new Set([20]);
-  if (tool === 'image') {
-    inProgressStatuses.add(45);
-  }
+  const inProgressStatuses = new Set([20, 45]);
 
   const candidates = [
     entry.fail_starling_message,
@@ -1319,6 +1315,15 @@ function classifyHistoryFailure(entry) {
   const message = normalizeWhitespace(entry?.fail_starling_message || historyEntryFailureMessage(entry) || '');
   const key = String(entry?.fail_starling_key || '').trim();
   const taskStatus = Number(entry?.task?.status ?? entry?.status);
+
+  // Status 45 is an in-progress state for image generation, not a failure
+  if (taskStatus === 45) {
+    return {
+      failureType: null,
+      failurePhase: null,
+      failureReason: null
+    };
+  }
 
   if (!message && !key) {
     return {
@@ -1710,6 +1715,14 @@ async function openLoginPopup(homePage, context) {
   const existingPages = new Set(context.pages());
   await loginButton.click();
   await homePage.waitForTimeout(1200);
+
+  // New flow: login button opens a dropdown menu with login method choices
+  const douyinLoginItem = homePage.getByText('抖音登录', { exact: true }).first();
+  if (await isVisible(douyinLoginItem)) {
+    logStep('Found login method menu, clicking 抖音登录.');
+    await douyinLoginItem.click();
+    await homePage.waitForTimeout(1500);
+  }
 
   const agreeButton = homePage.getByText('同意', { exact: true }).first();
   if (await isVisible(agreeButton)) {
@@ -2389,7 +2402,7 @@ async function waitForVideoReferenceEditorReady(page, timeoutMs = 10000) {
 
 async function findSubmitButton(page) {
   const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
-  const directButtons = scope.locator('button.submit-button-KJTUYS');
+  const directButtons = scope.locator('button[class*="submit-button-"]');
   const directCount = await directButtons.count();
   for (let i = 0; i < directCount; i += 1) {
     const locator = directButtons.nth(i);
@@ -2399,7 +2412,7 @@ async function findSubmitButton(page) {
     if (await locator.isDisabled().catch(() => false)) {
       continue;
     }
-    return { label: 'submit-button-KJTUYS', locator };
+    return { label: 'submit-button', locator };
   }
 
   const classButtons = scope.locator('button[class*="submit-button"]');
@@ -2621,7 +2634,7 @@ async function configureAspectResolution(page, args, labelPrefix) {
   }
 
   const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
-  const toolbarButton = scope.locator('button.toolbar-button-FhFnQ_').first();
+  const toolbarButton = scope.locator('button[class*="toolbar-button-"]').first();
   if (!(await isVisible(toolbarButton))) {
     throw new Error(`Could not find the ${labelPrefix} aspect/resolution toolbar button.`);
   }
