@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
+const { spawn } = require('child_process');
 const { chromium } = require('playwright');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -9,6 +11,8 @@ const RUNTIME_DIR = path.join(ROOT, 'runtime');
 const DEFAULT_USER_DATA_DIR = path.join(RUNTIME_DIR, 'jimeng-profile');
 const DEFAULT_ARTIFACTS_DIR = path.join(RUNTIME_DIR, 'artifacts');
 const DEFAULT_REGISTRY_PATH = path.join(RUNTIME_DIR, 'tracked-records.jsonl');
+const DEFAULT_DAEMON_IDLE_TIMEOUT_MS = 180000;
+const DAEMON_COMPATIBLE_COMMANDS = new Set(['generate', 'canvas-prompt', 'canvas-create-project', 'canvas-open-project', 'canvas-rename-project']);
 const TOOL_URLS = {
   home: 'https://jimeng.jianying.com/ai-tool/home',
   image: 'https://jimeng.jianying.com/ai-tool/generate/?type=image',
@@ -24,6 +28,8 @@ const SUBMIT_LABELS = [
   '生成视频'
 ];
 let JSON_OUTPUT = false;
+let ACTIVE_LOG_CAPTURE = null;
+let SUPPRESS_LOG_OUTPUT = false;
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -79,6 +85,26 @@ function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
+function removeFileIfExists(filePath) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
+function stableHash(value) {
+  const input = String(value || '');
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
 function isoTimestamp() {
   return new Date().toISOString();
 }
@@ -117,8 +143,32 @@ function setJsonOutput(enabled) {
   JSON_OUTPUT = enabled;
 }
 
+async function withCapturedLogs(callback, options = {}) {
+  const previousCapture = ACTIVE_LOG_CAPTURE;
+  const previousSuppress = SUPPRESS_LOG_OUTPUT;
+  const logs = [];
+  ACTIVE_LOG_CAPTURE = logs;
+  SUPPRESS_LOG_OUTPUT = Boolean(options.silent);
+  try {
+    const result = await callback();
+    return { result, logs };
+  } catch (error) {
+    error.capturedLogs = logs.slice();
+    throw error;
+  } finally {
+    ACTIVE_LOG_CAPTURE = previousCapture;
+    SUPPRESS_LOG_OUTPUT = previousSuppress;
+  }
+}
+
 function logStep(message) {
   const line = `[jimeng] ${message}`;
+  if (ACTIVE_LOG_CAPTURE) {
+    ACTIVE_LOG_CAPTURE.push(line);
+  }
+  if (SUPPRESS_LOG_OUTPUT) {
+    return;
+  }
   if (JSON_OUTPUT) {
     console.error(line);
     return;
@@ -141,6 +191,7 @@ async function safeNetworkIdle(page, timeout = 15000) {
 async function gotoAndSettle(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   await safeNetworkIdle(page);
+  await dismissBlockingOverlays(page);
 }
 
 async function isVisible(locator) {
@@ -179,6 +230,221 @@ function parseCommonOptions(args) {
     headless: boolFlag(args.headless, true),
     timeoutMs: integerFlag(args['timeout-ms'], 180000)
   };
+}
+
+function shouldUseDaemonForCommand(command, args) {
+  return DAEMON_COMPATIBLE_COMMANDS.has(command)
+    && !boolFlag(args['no-daemon'], false)
+    && !boolFlag(args['daemon-worker'], false);
+}
+
+function getDaemonIdleTimeoutMs(args) {
+  return integerFlag(args['daemon-idle-timeout-ms'], DEFAULT_DAEMON_IDLE_TIMEOUT_MS);
+}
+
+function buildDaemonSignature(options, args) {
+  return JSON.stringify({
+    userDataDir: path.resolve(options.userDataDir),
+    headless: Boolean(options.headless),
+    idleTimeoutMs: getDaemonIdleTimeoutMs(args)
+  });
+}
+
+function getDaemonSocketPath(signature) {
+  ensureDir(RUNTIME_DIR);
+  return path.join(RUNTIME_DIR, `jimeng-daemon-${stableHash(signature)}.sock`);
+}
+
+function replayCapturedLogs(logs, args) {
+  for (const line of logs || []) {
+    if (boolFlag(args.json, false)) {
+      console.error(line);
+      continue;
+    }
+    console.log(line);
+  }
+}
+
+function sendDaemonRequest(socketPath, payload, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const client = net.createConnection(socketPath);
+    let buffer = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        client.destroy();
+        reject(new Error(`Timed out waiting for daemon response after ${timeoutMs}ms.`));
+      }
+    }, timeoutMs);
+
+    const finalize = (callback) => (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+
+    client.on('connect', () => {
+      client.write(`${JSON.stringify(payload)}\n`);
+    });
+
+    client.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const newlineIndex = buffer.indexOf('\n');
+      if (newlineIndex === -1) {
+        return;
+      }
+      const line = buffer.slice(0, newlineIndex);
+      client.destroy();
+      finalize(() => {
+        try {
+          resolve(JSON.parse(line));
+        } catch (error) {
+          reject(new Error(`Failed to parse daemon response: ${error.message}. Raw: ${line.slice(0, 200)}`));
+        }
+      })();
+    });
+
+    client.on('end', finalize(() => {
+      if (buffer.trim()) {
+        try {
+          resolve(JSON.parse(buffer.trim()));
+        } catch (error) {
+          reject(new Error(`Daemon closed connection with unparseable data: ${error.message}. Raw: ${buffer.slice(0, 200)}`));
+        }
+      } else {
+        reject(new Error('Daemon closed the connection without sending a response.'));
+      }
+    }));
+
+    client.on('error', (error) => {
+      finalize(() => {
+        const code = error?.code || '';
+        if (code === 'ENOENT') {
+          reject(Object.assign(new Error(`Daemon socket not found at ${socketPath}. The daemon may not be running.`), { code }));
+        } else if (code === 'ECONNREFUSED') {
+          reject(Object.assign(new Error(`Daemon refused the connection on ${socketPath}. The daemon may have exited.`), { code }));
+        } else if (code === 'EACCES') {
+          reject(Object.assign(new Error(`Permission denied accessing daemon socket at ${socketPath}.`), { code }));
+        } else {
+          reject(Object.assign(new Error(`Daemon socket error (${code || 'unknown'}): ${error.message}`), { code }));
+        }
+      })();
+    });
+  });
+}
+
+async function waitForDaemon(socketPath, attempts = 30, delayMs = 200) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await sendDaemonRequest(socketPath, { type: 'ping' }, 1000);
+      return true;
+    } catch (error) {
+      const code = error?.code || '';
+      if (code === 'EACCES') {
+        throw new Error(`Permission denied accessing daemon socket at ${socketPath}. Check file permissions under runtime/.`);
+      }
+      // ENOENT / ECONNREFUSED / timeout: daemon not up yet, keep retrying.
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return false;
+}
+
+async function ensureDaemonProcess(socketPath, args) {
+  const ready = await waitForDaemon(socketPath, 1, 50);
+  if (ready) {
+    return true;
+  }
+
+  // Use a lock file to prevent concurrent clients from spawning multiple daemons.
+  const lockPath = `${socketPath}.lock`;
+  let lockFd = null;
+  try {
+    lockFd = fs.openSync(lockPath, 'wx');
+  } catch (error) {
+    if (error?.code !== 'EEXIST') {
+      throw new Error(`Could not create daemon lock file at ${lockPath}: ${error.message}`);
+    }
+    // Another client is spawning — wait for the daemon it's starting.
+    logStep('Another process is starting the browser daemon. Waiting for it to become ready...');
+    return waitForDaemon(socketPath, 40, 250);
+  }
+
+  try {
+    const daemonArgs = [
+      __filename,
+      'daemon',
+      '--socket-path',
+      socketPath,
+      '--user-data-dir',
+      path.resolve(args['user-data-dir'] || DEFAULT_USER_DATA_DIR),
+      '--headless',
+      String(boolFlag(args.headless, true)),
+      '--daemon-idle-timeout-ms',
+      String(getDaemonIdleTimeoutMs(args)),
+      '--timeout-ms',
+      String(integerFlag(args['timeout-ms'], 180000))
+    ];
+
+    const child = spawn(process.execPath, daemonArgs, {
+      cwd: ROOT,
+      detached: true,
+      stdio: 'ignore'
+    });
+    child.unref();
+
+    const daemonReady = await waitForDaemon(socketPath, 40, 250);
+    if (!daemonReady) {
+      throw new Error(`Browser daemon failed to start within the expected time. Socket: ${socketPath}`);
+    }
+    return true;
+  } finally {
+    try {
+      fs.closeSync(lockFd);
+    } catch {
+      // ignore
+    }
+    removeFileIfExists(lockPath);
+  }
+}
+
+async function maybeRunViaDaemon(command, args) {
+  if (!shouldUseDaemonForCommand(command, args)) {
+    return false;
+  }
+
+  const options = parseCommonOptions(args);
+  const signature = buildDaemonSignature(options, args);
+  const socketPath = getDaemonSocketPath(signature);
+  const requestTimeoutMs = Math.max(integerFlag(args['wait-timeout-ms'], options.timeoutMs), options.timeoutMs) + 60000;
+  const daemonReady = await ensureDaemonProcess(socketPath, args);
+  if (!daemonReady) {
+    logStep('Could not reach the browser reuse daemon. Falling back to a one-shot browser session.');
+    return false;
+  }
+
+  logStep('Routing this command through the browser reuse daemon.');
+  let response;
+  try {
+    response = await sendDaemonRequest(socketPath, {
+      type: 'command',
+      command,
+      args
+    }, requestTimeoutMs);
+  } catch (error) {
+    throw new Error(`Daemon request failed for command "${command}": ${error.message}`);
+  }
+
+  replayCapturedLogs(response.logs, args);
+  if (!response.ok) {
+    throw new Error(`Daemon reported an error for command "${command}": ${response.error || '(no error message)'}`);
+  }
+  maybeEmitJson(args, response.payload);
+  return true;
 }
 
 function normalizeWhitespace(value) {
@@ -251,6 +517,80 @@ async function getMainPage(context) {
   return existing || context.newPage();
 }
 
+function createDaemonState() {
+  return {
+    context: null,
+    mainPage: null,
+    canvasProjectPage: null,
+    sessionSignature: null,
+    idleTimer: null,
+    queue: Promise.resolve(),
+    idleTimeoutMs: DEFAULT_DAEMON_IDLE_TIMEOUT_MS,
+    onIdle: null
+  };
+}
+
+async function closeDaemonSession(state) {
+  clearTimeout(state.idleTimer);
+  state.idleTimer = null;
+  if (state.context) {
+    await state.context.close().catch(() => null);
+  }
+  state.context = null;
+  state.mainPage = null;
+  state.canvasProjectPage = null;
+  state.sessionSignature = null;
+}
+
+async function ensureDaemonSession(state, options, args) {
+  const signature = buildDaemonSignature(options, args);
+  if (state.context && state.sessionSignature !== signature) {
+    await closeDaemonSession(state);
+  }
+
+  if (!state.context) {
+    state.context = await launchContext(options);
+    state.mainPage = await getMainPage(state.context);
+    state.sessionSignature = signature;
+  }
+
+  if (!state.mainPage || state.mainPage.isClosed()) {
+    state.mainPage = await state.context.newPage();
+  }
+  if (state.canvasProjectPage && state.canvasProjectPage.isClosed()) {
+    state.canvasProjectPage = null;
+  }
+
+  state.idleTimeoutMs = getDaemonIdleTimeoutMs(args);
+  return state.context;
+}
+
+function scheduleDaemonIdleShutdown(state) {
+  clearTimeout(state.idleTimer);
+  state.idleTimer = setTimeout(() => {
+    const idleHandler = typeof state.onIdle === 'function'
+      ? state.onIdle()
+      : closeDaemonSession(state);
+    Promise.resolve(idleHandler).catch(() => null);
+  }, state.idleTimeoutMs);
+}
+
+async function resetReusablePage(page, label) {
+  if (!page || page.isClosed()) {
+    return;
+  }
+
+  const currentUrl = page.url();
+  if (!currentUrl || currentUrl === 'about:blank') {
+    return;
+  }
+
+  logStep(`Refreshing the reused ${label} page before the next task.`);
+  await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => null);
+  await safeNetworkIdle(page, 10000);
+  await dismissBlockingOverlays(page);
+}
+
 async function getBodyText(page, maxLength = 8000) {
   const text = await page.locator('body').innerText().catch(() => '');
   return text.slice(0, maxLength);
@@ -304,7 +644,7 @@ async function getActiveGeneratorRoot(page) {
       continue;
     }
 
-    const root = button.locator('xpath=ancestor::div[contains(@class,"dimension-layout-") and contains(@class,"default-layout-")][1]');
+    const root = button.locator('xpath=ancestor::div[contains(@class,"dimension-layout-") and contains(@class,"canvas-layout-")][1]');
     if (!(await root.count().catch(() => 0))) {
       continue;
     }
@@ -318,7 +658,7 @@ async function getActiveGeneratorRoot(page) {
     return best.root;
   }
 
-  const roots = page.locator('[class*="dimension-layout-"][class*="default-layout-"]');
+  const roots = page.locator('[class*="dimension-layout-"][class*="canvas-layout-"]');
   let fallback = null;
   const rootCount = await roots.count();
   for (let i = 0; i < rootCount; i += 1) {
@@ -373,6 +713,184 @@ const INSUFFICIENT_CREDITS_KEYWORDS = [
 
 // Modal wrapper class used by JiMeng for credit warning modals
 const MODAL_WRAPPER_SELECTOR = '.lv-modal-wrapper';
+const SAFE_DISMISS_TEXTS = [
+  '知道了',
+  '我知道了',
+  '跳过',
+  '关闭',
+  '稍后',
+  '暂不',
+  '暂时不用',
+  '下次再说',
+  '以后再说'
+];
+const AFFIRMATIVE_MODAL_BUTTON_TEXTS = ['确认', '确定', '同意', 'OK'];
+const KNOWN_CLOSE_SELECTORS = [
+  'button[class*="close-btn"]',
+  '[role="button"][class*="close-btn"]',
+  'button[class*="close-icon"]',
+  '[role="button"][class*="close-icon"]',
+  '[class*="close-icon-wrapper"]',
+  'button[aria-label*="关闭"]',
+  '[role="button"][aria-label*="关闭"]',
+  'button[title*="关闭"]',
+  '[role="button"][title*="关闭"]'
+];
+
+async function clickVisibleSelector(page, selector, options = {}) {
+  const matches = page.locator(selector);
+  const count = await matches.count().catch(() => 0);
+  for (let i = 0; i < count; i += 1) {
+    const current = matches.nth(i);
+    if (!(await isVisible(current))) {
+      continue;
+    }
+
+    const box = await current.boundingBox().catch(() => null);
+    if (!box) {
+      continue;
+    }
+    if (options.maxWidth && box.width > options.maxWidth) {
+      continue;
+    }
+    if (options.maxHeight && box.height > options.maxHeight) {
+      continue;
+    }
+
+    const text = normalizeWhitespace(await current.innerText().catch(() => ''));
+    if (options.requireBlankText && text) {
+      continue;
+    }
+
+    const clicked = await current.click({ force: true }).then(() => true).catch(() => false);
+    if (!clicked) {
+      continue;
+    }
+    await page.waitForTimeout(options.waitAfterMs || 400);
+
+    if (options.logMessage) {
+      const suffix = text ? `: ${truncateText(text, 60)}` : '';
+      logStep(`${options.logMessage}${suffix}`);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+async function clickVisibleTextTarget(page, text, options = {}) {
+  const locatorGroups = [
+    page.getByRole('button', { name: text, exact: true }),
+    page.locator('button, [role="button"], a')
+  ];
+
+  for (const candidates of locatorGroups) {
+    const count = await candidates.count().catch(() => 0);
+    for (let i = 0; i < count; i += 1) {
+      const current = candidates.nth(i);
+      if (!(await isVisible(current))) {
+        continue;
+      }
+
+      const box = await current.boundingBox().catch(() => null);
+      if (!box || box.width < 16 || box.height < 10) {
+        continue;
+      }
+
+      const currentText = normalizeWhitespace(await current.innerText().catch(() => ''));
+      if (currentText !== text) {
+        continue;
+      }
+
+      const clicked = await current.click({ force: true }).then(() => true).catch(() => false);
+      if (!clicked) {
+        continue;
+      }
+      await page.waitForTimeout(options.waitAfterMs || 400);
+      if (options.logMessage) {
+        logStep(`${options.logMessage}: ${text}`);
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function dismissKnownCloseButtons(page) {
+  for (const selector of KNOWN_CLOSE_SELECTORS) {
+    const clicked = await clickVisibleSelector(page, selector, {
+      maxWidth: 80,
+      maxHeight: 80,
+      logMessage: 'Dismissed a close button overlay'
+    });
+    if (clicked) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function dismissSafeTextOverlays(page) {
+  for (const text of SAFE_DISMISS_TEXTS) {
+    const clicked = await clickVisibleTextTarget(page, text, {
+      waitAfterMs: 500,
+      logMessage: 'Dismissed an overlay via safe action'
+    });
+    if (clicked) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function dismissBlockingOverlays(page, options = {}) {
+  const maxPasses = options.maxPasses || 4;
+  let dismissed = false;
+
+  for (let pass = 0; pass < maxPasses; pass += 1) {
+    if (await detectInsufficientCreditsModal(page)) {
+      return dismissed;
+    }
+
+    if (await dismissBindingModal(page)) {
+      dismissed = true;
+      continue;
+    }
+
+    if (await dismissKnownCloseButtons(page)) {
+      dismissed = true;
+      continue;
+    }
+
+    if (await dismissSafeTextOverlays(page)) {
+      dismissed = true;
+      continue;
+    }
+
+    if (options.allowAffirmative) {
+      for (const text of AFFIRMATIVE_MODAL_BUTTON_TEXTS) {
+        const clicked = await clickVisibleTextTarget(page, text, {
+          waitAfterMs: 500,
+          logMessage: 'Dismissed an overlay via affirmative action'
+        });
+        if (clicked) {
+          dismissed = true;
+          break;
+        }
+      }
+      if (dismissed) {
+        continue;
+      }
+    }
+
+    break;
+  }
+
+  return dismissed;
+}
 
 async function detectInsufficientCreditsModal(page) {
   // Check for modal wrapper presence
@@ -420,43 +938,22 @@ async function checkAndThrowInsufficientCredits(page) {
 }
 
 async function closeAnyModal(page) {
+  const closed = await dismissBlockingOverlays(page, { allowAffirmative: true, maxPasses: 3 });
+  if (closed) {
+    return true;
+  }
+
   const modalWrapper = page.locator(MODAL_WRAPPER_SELECTOR).first();
   if (!(await isVisible(modalWrapper))) {
     return false;
   }
 
-  // Get modal text for logging
   const modalText = await modalWrapper.innerText().catch(() => '');
   const firstLine = modalText.split('\n')[0].slice(0, 50);
-
-  // Try to find and click confirm button first (for safety confirmation, etc.)
-  const confirmButtons = modalWrapper.locator('button');
-  const btnCount = await confirmButtons.count();
-  for (let i = 0; i < btnCount; i++) {
-    const btn = confirmButtons.nth(i);
-    const btnText = (await btn.innerText().catch(() => '')).trim();
-    if (btnText === '确认' || btnText === '确定' || btnText === '同意' || btnText === 'OK') {
-      await btn.click();
-      await page.waitForTimeout(500);
-      logStep(`Closed modal by clicking "${btnText}": ${firstLine}...`);
-      return true;
-    }
-  }
-
-  // Try Escape key
-  await page.keyboard.press('Escape');
+  await page.keyboard.press('Escape').catch(() => null);
   await page.waitForTimeout(500);
   if (!(await isVisible(modalWrapper))) {
     logStep(`Closed modal by pressing Escape: ${firstLine}...`);
-    return true;
-  }
-
-  // Try close button (usually first or last button)
-  const closeBtn = confirmButtons.first();
-  if (await isVisible(closeBtn)) {
-    await closeBtn.click();
-    await page.waitForTimeout(500);
-    logStep(`Closed modal by clicking first button: ${firstLine}...`);
     return true;
   }
 
@@ -647,7 +1144,7 @@ async function waitForDelayedRecordCard(page, options) {
     await page.waitForTimeout(options.reloadIntervalMs);
     await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => null);
     await safeNetworkIdle(page, 12000);
-    await dismissBindingModal(page);
+    await dismissBlockingOverlays(page);
   }
 
   return null;
@@ -1582,7 +2079,7 @@ async function waitForRecordCompletion(page, recordId, tool, timeoutMs, pollInte
     await page.waitForTimeout(pollIntervalMs);
     await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => null);
     await safeNetworkIdle(page, 12000);
-    await dismissBindingModal(page);
+    await dismissBlockingOverlays(page);
   }
 
   return {
@@ -1684,6 +2181,7 @@ async function findQrImage(popup) {
 
 async function openLoginPopup(homePage, context) {
   await gotoAndSettle(homePage, TOOL_URLS.home);
+  await dismissBlockingOverlays(homePage);
 
   const loginButton = homePage.getByText('登录', { exact: true }).first();
   if (!(await isVisible(loginButton))) {
@@ -1788,11 +2286,11 @@ async function navigateToTool(page, tool) {
   const resolvedTool = tool || 'home';
   const url = TOOL_URLS[resolvedTool] || TOOL_URLS.home;
   await gotoAndSettle(page, url);
-  await dismissBindingModal(page);
+  await dismissBlockingOverlays(page);
   if (['image', 'video'].includes(resolvedTool) && page.url().includes('/ai-tool/home')) {
     const opened = await openGeneratorFromHome(page, resolvedTool);
     if (opened) {
-      await dismissBindingModal(page);
+      await dismissBlockingOverlays(page);
     }
   }
   return page;
@@ -1833,15 +2331,16 @@ async function dismissCanvasOnboarding(page) {
 async function waitForCanvasProjectReady(page) {
   await page.waitForLoadState('domcontentloaded');
   await safeNetworkIdle(page, 10000);
-  await dismissBindingModal(page);
+  await dismissBlockingOverlays(page);
   await dismissCanvasOnboarding(page);
+  await dismissBlockingOverlays(page);
   return page;
 }
 
 async function openCanvasHome(page) {
   await navigateToTool(page, 'canvas');
   await safeNetworkIdle(page, 10000);
-  await dismissBindingModal(page);
+  await dismissBlockingOverlays(page);
   return page;
 }
 
@@ -1946,8 +2445,52 @@ async function ensureCanvasConversationOpen(page) {
   }
 
   await toggle.click({ force: true }).catch(() => null);
-  await page.waitForTimeout(800);
+  await page.waitForSelector('[role="textbox"].ProseMirror', { state: 'visible', timeout: 3000 }).catch(() => null);
   return findCanvasPromptEditor(page);
+}
+
+async function resolveCanvasPromptTargetPage(context, args, options, runtime = {}) {
+  if (!runtime.daemonState) {
+    const page = runtime.page || await getMainPage(context);
+    return resolveCanvasProjectPage(page, context, args, options);
+  }
+
+  const state = runtime.daemonState;
+  const requestedProjectId = args['project-id']
+    ? String(args['project-id'])
+    : extractCanvasProjectId(args['project-url']);
+
+  if (state.canvasProjectPage && !state.canvasProjectPage.isClosed()) {
+    if (requestedProjectId) {
+      const currentProjectId = extractCanvasProjectId(state.canvasProjectPage.url());
+      if (currentProjectId === requestedProjectId) {
+        await resetReusablePage(state.canvasProjectPage, 'canvas project');
+        return state.canvasProjectPage;
+      }
+    } else if (args['project-name']) {
+      await resetReusablePage(state.canvasProjectPage, 'canvas project');
+      const reloadedUrl = state.canvasProjectPage.url();
+      if (extractCanvasProjectId(reloadedUrl)) {
+        const currentProjectName = await getCanvasProjectName(state.canvasProjectPage).catch(() => null);
+        if (currentProjectName === args['project-name']) {
+          return state.canvasProjectPage;
+        }
+        logStep(`Reused canvas page project name mismatch: expected "${args['project-name']}", got "${currentProjectName || '(unknown)'}". Re-navigating.`);
+      } else {
+        logStep(`Reused canvas page redirected away from canvas (now at ${reloadedUrl}). Re-navigating.`);
+      }
+    }
+  }
+
+  const page = state.mainPage || await getMainPage(context);
+  const projectPage = await resolveCanvasProjectPage(page, context, args, options);
+  if (extractCanvasProjectId(projectPage.url())) {
+    state.canvasProjectPage = projectPage;
+  }
+  if (!state.mainPage || state.mainPage.isClosed()) {
+    state.mainPage = page;
+  }
+  return projectPage;
 }
 
 async function findCanvasPromptEditor(page) {
@@ -2349,16 +2892,16 @@ async function maybeUploadVideoReferences(page, args) {
   }
 
   if (firstFrameFiles.length || lastFrameFiles.length) {
-    const referenceGroups = scope.locator('.references-vWIzeo .reference-group-_DAGw1');
+    const firstGroup = scope.locator('[class*="reference-group-"]:not([class*="last-frame-"]):not([class*="collapsed-"]):not([class*="content-"]):not([class*="background-"]):not([class*="hover-"])').first();
+    const lastGroup = scope.locator('[class*="reference-group-"][class*="last-frame-"]:not([class*="collapsed-"])').first();
     if (firstFrameFiles.length) {
-      await setFileInputFiles(referenceGroups.nth(0).locator('input[type="file"]').first(), firstFrameFiles);
+      await setFileInputFiles(firstGroup.locator('input[type="file"]').first(), firstFrameFiles);
     }
     if (lastFrameFiles.length) {
-      const lastInput = referenceGroups.nth(1).locator('input[type="file"]').first();
-      if (!(await lastInput.count().catch(() => 0))) {
+      if (!(await lastGroup.count().catch(() => 0))) {
         throw new Error('The current video mode does not expose a tail-frame file input for --last-frame-file.');
       }
-      await setFileInputFiles(lastInput, lastFrameFiles);
+      await setFileInputFiles(lastGroup.locator('input[type="file"]').first(), lastFrameFiles);
     }
     return true;
   }
@@ -2374,10 +2917,9 @@ async function maybeUploadVideoReferences(page, args) {
     }
 
     if (inputDetails.every((detail) => !detail.multiple)) {
-      const referenceGroups = scope.locator('.references-vWIzeo .reference-group-_DAGw1');
-      await setFileInputFiles(referenceGroups.nth(0).locator('input[type="file"]').first(), [genericFiles[0]]);
+      await setFileInputFiles(fileInputs.nth(0), [genericFiles[0]]);
       if (genericFiles[1]) {
-        await setFileInputFiles(referenceGroups.nth(1).locator('input[type="file"]').first(), [genericFiles[1]]);
+        await setFileInputFiles(fileInputs.nth(1), [genericFiles[1]]);
       }
       return true;
     }
@@ -2400,7 +2942,7 @@ async function waitForVideoReferenceEditorReady(page, timeoutMs = 10000) {
   const started = Date.now();
   const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
   while (Date.now() - started < timeoutMs) {
-    const miniUpload = await scope.locator('.reference-upload-h7tmnr.mini-XAjjpa').count().catch(() => 0);
+    const miniUpload = await scope.locator('[class*="reference-upload-"][class*="mini-"]').count().catch(() => 0);
     const promptEditors = await scope.locator('[contenteditable="true"]').count().catch(() => 0);
     if (miniUpload > 0 && promptEditors > 0) {
       return true;
@@ -2589,7 +3131,7 @@ async function chooseVisibleSelectOption(page, optionText, matchText = null) {
         continue;
       }
       await current.evaluate((node) => node.click()).catch(() => null);
-      await page.waitForTimeout(500);
+      await page.waitForSelector('.lv-select-popup', { state: 'hidden', timeout: 1500 }).catch(() => null);
       return true;
     }
 
@@ -2627,7 +3169,7 @@ async function openSelectPopup(page, locator) {
     await page.keyboard.press('Escape').catch(() => null);
     await page.waitForTimeout(150);
     await attempt();
-    await page.waitForTimeout(400);
+    await page.waitForSelector('.lv-select-popup', { state: 'visible', timeout: 1500 }).catch(() => null);
     if (await hasVisibleSelectPopup(page)) {
       return true;
     }
@@ -2659,12 +3201,24 @@ async function getVisibleComboboxTexts(page) {
 
 async function verifyVideoOptionSelections(page, args) {
   const values = await getVisibleComboboxTexts(page);
-  const actual = {
-    tool: values[0] || null,
-    model: values[1] || null,
-    referenceMode: values[2] || null,
-    duration: values[3] || null
-  };
+
+  // Match by known value patterns rather than fixed position, since
+  // some comboboxes may be absent depending on the current mode.
+  const modelOptions = ['Seedance', 'Seedream'];
+  const referenceModeOptions = ['全能参考', '首尾帧', '主体参考'];
+  const durationPattern = /^\d+s$/;
+
+  // Skip values[0] which is always the tool switcher (图片生成/视频生成)
+  const actual = { model: null, referenceMode: null, duration: null };
+  for (const v of values.slice(1)) {
+    if (!actual.model && modelOptions.some((prefix) => v.includes(prefix))) {
+      actual.model = v;
+    } else if (!actual.referenceMode && referenceModeOptions.some((opt) => v.includes(opt))) {
+      actual.referenceMode = v;
+    } else if (!actual.duration && durationPattern.test(v)) {
+      actual.duration = v;
+    }
+  }
 
   const mismatches = [];
   if (args.model && actual.model !== args.model) {
@@ -2708,7 +3262,6 @@ async function chooseToolbarOption(page, groupRole, optionText) {
         continue;
       }
       await option.click({ force: true }).catch(() => null);
-      await option.evaluate((node) => node.click()).catch(() => null);
       await page.waitForTimeout(300);
       return true;
     }
@@ -2718,7 +3271,7 @@ async function chooseToolbarOption(page, groupRole, optionText) {
 }
 
 async function configureImageOptions(page, args) {
-  await dismissBindingModal(page);
+  await dismissBlockingOverlays(page);
 
   if (args.model) {
     await chooseSelectOption(page, 1, args.model);
@@ -2733,26 +3286,34 @@ async function configureAspectResolution(page, args, labelPrefix) {
     return;
   }
 
-  const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
-  const toolbarButtons = scope.locator('button[class*="toolbar-button-"]');
-  const visibleButtons = [];
-  const buttonCount = await toolbarButtons.count().catch(() => 0);
-  for (let i = 0; i < buttonCount; i += 1) {
-    const current = toolbarButtons.nth(i);
-    const box = await current.boundingBox().catch(() => null);
-    if (!box || box.width < 20 || box.height < 20) {
-      continue;
+  // Wait up to 5s for toolbar buttons to become visible after tool switch
+  let visibleButtons = [];
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const scope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+    const toolbarButtons = scope.locator('button[class*="toolbar-button-"]');
+    const buttonCount = await toolbarButtons.count().catch(() => 0);
+    visibleButtons = [];
+    for (let i = 0; i < buttonCount; i += 1) {
+      const current = toolbarButtons.nth(i);
+      const box = await current.boundingBox().catch(() => null);
+      if (!box || box.width < 20 || box.height < 20) {
+        continue;
+      }
+      if (!(await isVisible(current))) {
+        continue;
+      }
+      visibleButtons.push(current);
     }
-    if (!(await isVisible(current))) {
-      continue;
+    if (visibleButtons.length > 0) {
+      break;
     }
-    visibleButtons.push(current);
+    await page.waitForTimeout(300);
   }
 
   let toolbarOpened = false;
   for (const button of visibleButtons) {
     await button.click({ force: true }).catch(() => null);
-    await button.evaluate((node) => node.click()).catch(() => null);
     await page.waitForTimeout(400);
     const groups = page.locator('.lv-popover-content [role="radiogroup"]');
     if ((await groups.count().catch(() => 0)) > 0) {
@@ -2786,7 +3347,7 @@ async function configureAspectResolution(page, args, labelPrefix) {
 }
 
 async function configureVideoOptions(page, args) {
-  await dismissBindingModal(page);
+  await dismissBlockingOverlays(page);
 
   if (args.model) {
     await chooseSelectOption(page, 1, args.model);
@@ -2822,7 +3383,6 @@ async function selectCanvasConversationTool(page, tool) {
   // Try to find the combobox regardless of its current text (Agent 模式, 图片生成, etc.)
   const chosen = await chooseVisibleSelectOption(page, label, null);
   if (chosen) {
-    await page.waitForTimeout(800);
     const confirmed = await waitForCanvasConversationTool(page, tool);
     if (!confirmed) {
       throw new Error(`The canvas conversation tool did not switch to ${label}.`);
@@ -2940,7 +3500,7 @@ async function locateRecordAcrossTools(page, recordId, toolCandidates) {
     lastTool = tool;
     await navigateToTool(page, tool);
     await safeNetworkIdle(page, 10000);
-    await dismissBindingModal(page);
+    await dismissBlockingOverlays(page);
     if (await pageLooksLoggedOut(page)) {
       throw new Error('JiMeng is not logged in. Run the login command before record lookup.');
     }
@@ -3041,36 +3601,102 @@ async function commandOpenTool(args) {
   }
 }
 
+async function executeCanvasCreateProject(options, context, runtime = {}) {
+  const state = runtime.daemonState;
+  const page = state?.mainPage || await getMainPage(context);
+  if (state && (!state.mainPage || state.mainPage.isClosed())) {
+    state.mainPage = page;
+  }
+
+  await openCanvasHome(page);
+  if (await pageLooksLoggedOut(page)) {
+    throw new Error('JiMeng is not logged in. Run the login command before creating a canvas project.');
+  }
+
+  const projectPage = await createCanvasProjectFromHome(page, context, options.timeoutMs);
+  if (state) {
+    state.canvasProjectPage = projectPage;
+  }
+
+  const projectId = extractCanvasProjectId(projectPage.url());
+  const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-create-project');
+  logStep(`Created a new canvas project window. URL: ${projectPage.url()}`);
+  if (snapshot) {
+    logStep(`Saved canvas project snapshot: ${snapshot.screenshot}`);
+  }
+
+  return {
+    ok: true,
+    command: 'canvas-create-project',
+    projectId,
+    projectUrl: projectPage.url(),
+    projectTitle: await projectPage.title(),
+    projectName: await getCanvasProjectName(projectPage),
+    screenshot: snapshot?.screenshot || null,
+    snapshotJson: snapshot?.jsonPath || null,
+    snapshotText: snapshot?.textPath || null
+  };
+}
+
+async function executeCanvasOpenProject(args, options, context, runtime = {}) {
+  const projectPage = await resolveCanvasPromptTargetPage(context, args, options, runtime);
+  if (await pageLooksLoggedOut(projectPage)) {
+    throw new Error('JiMeng is not logged in. Run the login command before opening a canvas project.');
+  }
+
+  const projectId = extractCanvasProjectId(projectPage.url());
+  const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-open-project');
+  logStep(`Opened canvas project. URL: ${projectPage.url()}`);
+
+  return {
+    ok: true,
+    command: 'canvas-open-project',
+    projectId,
+    projectUrl: projectPage.url(),
+    projectTitle: await projectPage.title(),
+    projectName: await getCanvasProjectName(projectPage),
+    screenshot: snapshot?.screenshot || null,
+    snapshotJson: snapshot?.jsonPath || null,
+    snapshotText: snapshot?.textPath || null
+  };
+}
+
+async function executeCanvasRenameProject(args, options, context, runtime = {}) {
+  const newName = args.name || args['new-name'];
+  if (!newName) {
+    throw new Error('The canvas-rename-project command requires --name "..."');
+  }
+
+  const projectPage = await resolveCanvasPromptTargetPage(context, args, options, runtime);
+  if (await pageLooksLoggedOut(projectPage)) {
+    throw new Error('JiMeng is not logged in. Run the login command before renaming a canvas project.');
+  }
+
+  await renameCanvasProject(projectPage, newName);
+  const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-rename-project');
+  const projectId = extractCanvasProjectId(projectPage.url());
+  logStep(`Renamed canvas project to: ${newName}`);
+
+  return {
+    ok: true,
+    command: 'canvas-rename-project',
+    projectId,
+    projectUrl: projectPage.url(),
+    projectTitle: await projectPage.title(),
+    projectName: await getCanvasProjectName(projectPage),
+    name: newName,
+    screenshot: snapshot?.screenshot || null,
+    snapshotJson: snapshot?.jsonPath || null,
+    snapshotText: snapshot?.textPath || null
+  };
+}
+
 async function commandCanvasCreateProject(args) {
   const options = parseCommonOptions(args);
   const context = await launchContext(options);
-
   try {
-    const page = await getMainPage(context);
-    await openCanvasHome(page);
-    if (await pageLooksLoggedOut(page)) {
-      throw new Error('JiMeng is not logged in. Run the login command before creating a canvas project.');
-    }
-
-    const projectPage = await createCanvasProjectFromHome(page, context, options.timeoutMs);
-    const projectId = extractCanvasProjectId(projectPage.url());
-    const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-create-project');
-    logStep(`Created a new canvas project window. URL: ${projectPage.url()}`);
-    if (snapshot) {
-      logStep(`Saved canvas project snapshot: ${snapshot.screenshot}`);
-    }
-
-    maybeEmitJson(args, {
-      ok: true,
-      command: 'canvas-create-project',
-      projectId,
-      projectUrl: projectPage.url(),
-      projectTitle: await projectPage.title(),
-      projectName: await getCanvasProjectName(projectPage),
-      screenshot: snapshot?.screenshot || null,
-      snapshotJson: snapshot?.jsonPath || null,
-      snapshotText: snapshot?.textPath || null
-    });
+    const result = await executeCanvasCreateProject(options, context);
+    maybeEmitJson(args, result);
   } finally {
     await context.close();
   }
@@ -3080,45 +3706,11 @@ async function commandCanvasOpenProject(args) {
   if (!args['project-name'] && !args['project-id'] && !args['project-url']) {
     throw new Error('The canvas-open-project command requires --project-name, --project-id, or --project-url.');
   }
-
   const options = parseCommonOptions(args);
   const context = await launchContext(options);
-
   try {
-    const page = await getMainPage(context);
-    let projectPage = null;
-
-    if (args['project-name']) {
-      await openCanvasHome(page);
-      if (await pageLooksLoggedOut(page)) {
-        throw new Error('JiMeng is not logged in. Run the login command before opening a canvas project.');
-      }
-      projectPage = await openCanvasProjectFromList(
-        page,
-        context,
-        args['project-name'],
-        integerFlag(args['project-index'], 1),
-        options.timeoutMs
-      );
-    } else {
-      projectPage = await resolveCanvasProjectPage(page, context, args, options);
-    }
-
-    const projectId = extractCanvasProjectId(projectPage.url());
-    const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-open-project');
-    logStep(`Opened canvas project. URL: ${projectPage.url()}`);
-
-    maybeEmitJson(args, {
-      ok: true,
-      command: 'canvas-open-project',
-      projectId,
-      projectUrl: projectPage.url(),
-      projectTitle: await projectPage.title(),
-      projectName: await getCanvasProjectName(projectPage),
-      screenshot: snapshot?.screenshot || null,
-      snapshotJson: snapshot?.jsonPath || null,
-      snapshotText: snapshot?.textPath || null
-    });
+    const result = await executeCanvasOpenProject(args, options, context);
+    maybeEmitJson(args, result);
   } finally {
     await context.close();
   }
@@ -3129,559 +3721,538 @@ async function commandCanvasRenameProject(args) {
   if (!newName) {
     throw new Error('The canvas-rename-project command requires --name "..."');
   }
-
   const options = parseCommonOptions(args);
   const context = await launchContext(options);
-
   try {
-    const page = await getMainPage(context);
-    const projectPage = await resolveCanvasProjectPage(page, context, args, options);
-    if (await pageLooksLoggedOut(projectPage)) {
-      throw new Error('JiMeng is not logged in. Run the login command before renaming a canvas project.');
-    }
-
-    await renameCanvasProject(projectPage, newName);
-    const snapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-rename-project');
-    const projectId = extractCanvasProjectId(projectPage.url());
-    logStep(`Renamed canvas project to: ${newName}`);
-
-    maybeEmitJson(args, {
-      ok: true,
-      command: 'canvas-rename-project',
-      projectId,
-      projectUrl: projectPage.url(),
-      projectTitle: await projectPage.title(),
-      projectName: await getCanvasProjectName(projectPage),
-      name: newName,
-      screenshot: snapshot?.screenshot || null,
-      snapshotJson: snapshot?.jsonPath || null,
-      snapshotText: snapshot?.textPath || null
-    });
+    const result = await executeCanvasRenameProject(args, options, context);
+    maybeEmitJson(args, result);
   } finally {
     await context.close();
   }
 }
 
-async function commandCanvasPrompt(args) {
+async function executeCanvasPrompt(args, options, context, runtime = {}) {
   const prompt = args.prompt;
   if (!prompt) {
     throw new Error('The canvas-prompt command requires --prompt "..."');
   }
 
-  const options = parseCommonOptions(args);
-  const context = await launchContext(options);
+  const projectPage = await resolveCanvasPromptTargetPage(context, args, options, runtime);
+  if (await pageLooksLoggedOut(projectPage)) {
+    throw new Error('JiMeng is not logged in. Run the login command before using a canvas project.');
+  }
 
-  try {
-    const page = await getMainPage(context);
-    const projectPage = await resolveCanvasProjectPage(page, context, args, options);
-    if (await pageLooksLoggedOut(projectPage)) {
-      throw new Error('JiMeng is not logged in. Run the login command before using a canvas project.');
+  let target = await ensureCanvasConversationOpen(projectPage);
+  if (!target) {
+    throw new Error('Could not find the canvas project conversation editor.');
+  }
+
+  const kind = normalizeCanvasKind(args.kind);
+  let resolvedTool = kind === 'auto' ? null : kind;
+  if (resolvedTool) {
+    await selectCanvasConversationTool(projectPage, resolvedTool);
+    if (resolvedTool === 'image') {
+      await configureImageOptions(projectPage, args);
+    } else if (resolvedTool === 'video') {
+      await configureVideoOptions(projectPage, args);
     }
-
-    let target = await ensureCanvasConversationOpen(projectPage);
+    target = await ensureCanvasConversationOpen(projectPage);
     if (!target) {
-      throw new Error('Could not find the canvas project conversation editor.');
+      throw new Error('Could not find the canvas project conversation editor after switching tools.');
     }
+  }
 
-    const kind = normalizeCanvasKind(args.kind);
-    let resolvedTool = kind === 'auto' ? null : kind;
-    if (resolvedTool) {
-      await selectCanvasConversationTool(projectPage, resolvedTool);
-      if (resolvedTool === 'image') {
-        await configureImageOptions(projectPage, args);
-      } else if (resolvedTool === 'video') {
-        await configureVideoOptions(projectPage, args);
-      }
-      target = await ensureCanvasConversationOpen(projectPage);
-      if (!target) {
-        throw new Error('Could not find the canvas project conversation editor after switching tools.');
-      }
+  const composedPrompt = buildCanvasPrompt(prompt);
+  if (!resolvedTool) {
+    if (projectPage.url().includes('type=video')) {
+      resolvedTool = 'video';
+    } else if (projectPage.url().includes('type=image')) {
+      resolvedTool = 'image';
     }
+  }
 
-    const composedPrompt = buildCanvasPrompt(prompt);
-    if (!resolvedTool) {
-      if (projectPage.url().includes('type=video')) {
-        resolvedTool = 'video';
-      } else if (projectPage.url().includes('type=image')) {
-        resolvedTool = 'image';
-      }
+  const {
+    genericReferenceInput,
+    uploadRequested,
+    uploadBeforePrompt,
+    needsReferenceMentions
+  } = getReferenceMentionPlan(resolvedTool, composedPrompt, args);
+  let uploadWorked = false;
+
+  if (uploadBeforePrompt) {
+    uploadWorked = resolvedTool === 'video'
+      ? await maybeUploadVideoReferences(projectPage, args)
+      : await maybeUploadImage(projectPage, genericReferenceInput);
+    if (needsReferenceMentions && !uploadWorked) {
+      throw new Error(`Could not upload the canvas ${resolvedTool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
     }
-
-    const {
-      genericReferenceInput,
-      uploadRequested,
-      uploadBeforePrompt,
-      needsReferenceMentions
-    } = getReferenceMentionPlan(resolvedTool, composedPrompt, args);
-    let uploadWorked = false;
-
-    if (uploadBeforePrompt) {
-      uploadWorked = resolvedTool === 'video'
-        ? await maybeUploadVideoReferences(projectPage, args)
-        : await maybeUploadImage(projectPage, genericReferenceInput);
-      if (needsReferenceMentions && !uploadWorked) {
-        throw new Error(`Could not upload the canvas ${resolvedTool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
-      }
-      if (uploadWorked && resolvedTool === 'video') {
-        await waitForVideoReferenceEditorReady(projectPage, 10000);
-      }
-      if (uploadWorked && needsReferenceMentions) {
-        await projectPage.waitForTimeout(5000);
-      }
-      target = await ensureCanvasConversationOpen(projectPage);
-      if (!target) {
-        throw new Error(`Could not find the canvas project conversation editor after ${resolvedTool === 'video' ? 'video reference' : 'reference image'} upload.`);
-      }
-      if (needsReferenceMentions && target.type !== 'editor') {
-        throw new Error('Could not find the canvas rich-text editor needed for @ mentions.');
-      }
+    if (uploadWorked && resolvedTool === 'video') {
+      await waitForVideoReferenceEditorReady(projectPage, 10000);
     }
-
-    await fillPrompt(target, composedPrompt, { enableReferenceMentions: needsReferenceMentions });
-
-    if (!uploadBeforePrompt) {
-      uploadWorked = resolvedTool === 'video'
-        ? await maybeUploadVideoReferences(projectPage, args)
-        : await maybeUploadImage(projectPage, genericReferenceInput);
+    if (uploadWorked && needsReferenceMentions) {
+      await projectPage.waitForTimeout(5000);
     }
-
-    if (uploadRequested) {
-      const uploadLabel = resolvedTool === 'video'
-        ? 'Uploaded the canvas video reference file(s).'
-        : 'Uploaded the canvas reference image file(s).';
-      const uploadMissLabel = resolvedTool === 'video'
-        ? 'Did not find a file input for the canvas video reference upload.'
-        : 'Did not find a file input for the canvas reference image upload.';
-      logStep(uploadWorked ? uploadLabel : uploadMissLabel);
+    target = await ensureCanvasConversationOpen(projectPage);
+    if (!target) {
+      throw new Error(`Could not find the canvas project conversation editor after ${resolvedTool === 'video' ? 'video reference' : 'reference image'} upload.`);
     }
-
-    const submitButton = await findSubmitButton(projectPage);
-    if (!submitButton) {
-      throw new Error('Could not find the canvas project submit button.');
+    if (needsReferenceMentions && target.type !== 'editor') {
+      throw new Error('Could not find the canvas rich-text editor needed for @ mentions.');
     }
-    const submitRetries = integerFlag(args['submit-retries'], resolvedTool === 'video' ? 2 : 0);
-    const retryDelayMs = integerFlag(args['submit-retry-delay-ms'], resolvedTool === 'video' ? 60000 : 15000);
-    const recordIdWaitMs = integerFlag(args['record-id-wait-ms'], resolvedTool === 'video' ? 180000 : 60000);
-    let trackedRecord = null;
-    let submitSignal = 'no-signal';
-    let pendingMarker = null;
-    let attemptCount = 0;
-    let generateApiResult = null;
-    let submitRequestPath = null;
-    let beforeSnapshot = null;
-    let afterSnapshot = null;
+  }
 
-    for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
-      attemptCount = attempt + 1;
-      const previousRecordIds = new Set((await collectLoadedRecordCards(projectPage)).map((card) => card.recordId));
-      beforeSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-before-submit');
+  await fillPrompt(target, composedPrompt, { enableReferenceMentions: needsReferenceMentions });
 
-      // Check for insufficient credits modal before clicking submit
-      await checkAndThrowInsufficientCredits(projectPage);
+  if (!uploadBeforePrompt) {
+    uploadWorked = resolvedTool === 'video'
+      ? await maybeUploadVideoReferences(projectPage, args)
+      : await maybeUploadImage(projectPage, genericReferenceInput);
+  }
 
-      // Close any blocking modal (safety confirmation, etc.)
-      await closeAnyModal(projectPage);
+  if (uploadRequested) {
+    const uploadLabel = resolvedTool === 'video'
+      ? 'Uploaded the canvas video reference file(s).'
+      : 'Uploaded the canvas reference image file(s).';
+    const uploadMissLabel = resolvedTool === 'video'
+      ? 'Did not find a file input for the canvas video reference upload.'
+      : 'Did not find a file input for the canvas reference image upload.';
+    logStep(uploadWorked ? uploadLabel : uploadMissLabel);
+  }
 
-      const generateApiPromise = waitForGenerateApiResult(projectPage, Math.min(options.timeoutMs, 30000));
+  const submitButton = await findSubmitButton(projectPage);
+  if (!submitButton) {
+    throw new Error('Could not find the canvas project submit button.');
+  }
+  const submitRetries = integerFlag(args['submit-retries'], resolvedTool === 'video' ? 2 : 0);
+  const retryDelayMs = integerFlag(args['submit-retry-delay-ms'], resolvedTool === 'video' ? 60000 : 15000);
+  const recordIdWaitMs = integerFlag(args['record-id-wait-ms'], resolvedTool === 'video' ? 180000 : 60000);
+  let trackedRecord = null;
+  let submitSignal = 'no-signal';
+  let pendingMarker = null;
+  let attemptCount = 0;
+  let generateApiResult = null;
+  let submitRequestPath = null;
+  let beforeSnapshot = null;
+  let afterSnapshot = null;
+
+  for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
+    attemptCount = attempt + 1;
+    const previousRecordIds = new Set((await collectLoadedRecordCards(projectPage)).map((card) => card.recordId));
+    beforeSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-before-submit');
+
+    await checkAndThrowInsufficientCredits(projectPage);
+    await closeAnyModal(projectPage);
+
+    const generateApiPromise = waitForGenerateApiResult(projectPage, Math.min(options.timeoutMs, 30000));
+    await submitButton.locator.click({ force: true });
+    await projectPage.waitForTimeout(500);
+
+    const modalClosed = await closeAnyModal(projectPage);
+    if (modalClosed) {
+      await projectPage.waitForTimeout(300);
       await submitButton.locator.click({ force: true });
-
-      // Wait a moment and check for modals after click
       await projectPage.waitForTimeout(500);
+    }
 
-      // Check if a safety confirmation modal appeared and handle it
-      const modalClosed = await closeAnyModal(projectPage);
-      if (modalClosed) {
-        // Modal was closed, wait a bit and try clicking submit again
-        await projectPage.waitForTimeout(300);
-        await submitButton.locator.click({ force: true });
-        await projectPage.waitForTimeout(500);
-      }
+    await checkAndThrowInsufficientCredits(projectPage);
 
-      await checkAndThrowInsufficientCredits(projectPage);
+    generateApiResult = await generateApiPromise;
+    if (!submitRequestPath && generateApiResult?.requestBody) {
+      submitRequestPath = artifactPath(options.artifactsDir, 'canvas-submit-request', 'json');
+      fs.writeFileSync(submitRequestPath, JSON.stringify(generateApiResult.requestBody, null, 2));
+    }
 
-      generateApiResult = await generateApiPromise;
-      if (!submitRequestPath && generateApiResult?.requestBody) {
-        submitRequestPath = artifactPath(options.artifactsDir, 'canvas-submit-request', 'json');
-        fs.writeFileSync(submitRequestPath, JSON.stringify(generateApiResult.requestBody, null, 2));
-      }
-
-      if (generateApiResult && !generateApiResult.accepted) {
-        const serverMessage = `Server rejected canvas submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
-        if (attempt < submitRetries) {
-          logStep(`${serverMessage}. Waiting ${retryDelayMs}ms before retrying.`);
-          await projectPage.waitForTimeout(retryDelayMs);
-          await dismissBindingModal(projectPage);
-          continue;
-        }
-        throw new Error(serverMessage);
-      }
-
-      const submitState = await waitForSubmitState(projectPage, {
-        previousIds: previousRecordIds,
-        prompt: composedPrompt,
-        tool: resolvedTool,
-        timeoutMs: Math.min(options.timeoutMs, resolvedTool === 'video' ? 30000 : 20000)
-      });
-      await projectPage.waitForTimeout(integerFlag(args['wait-after-submit-ms'], 8000));
-      afterSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-after-submit');
-
-      if (submitState.recordCard) {
-        trackedRecord = {
-          ...submitState.recordCard,
-          historyRecordId: generateApiResult?.historyRecordId || null,
-          taskId: generateApiResult?.taskId || null
-        };
-        submitSignal = submitState.signal;
-        pendingMarker = submitState.pendingMarker || null;
-        break;
-      }
-
-      if (submitState.signal === 'video-pending') {
-        submitSignal = submitState.signal;
-        pendingMarker = submitState.pendingMarker || null;
-        trackedRecord = await waitForDelayedRecordCard(projectPage, {
-          prompt: composedPrompt,
-          timeoutMs: Math.min(options.timeoutMs, recordIdWaitMs),
-          reloadIntervalMs: 15000
-        });
-        if (trackedRecord) {
-          submitSignal = 'delayed-record';
-          trackedRecord = {
-            ...trackedRecord,
-            historyRecordId: generateApiResult?.historyRecordId || null,
-            taskId: generateApiResult?.taskId || null
-          };
-        } else if (generateApiResult?.accepted) {
-          submitSignal = 'server-accepted-no-record-id';
-        }
-        break;
-      }
-
-      if (submitState.signal === 'insufficient-credits') {
-        const creditModal = submitState.creditModal;
-        const creditMsg = creditModal?.creditAmount
-          ? `当前积分: ${creditModal.creditAmount}`
-          : '请检查账户积分余额';
-        throw new Error(`积分不足，无法生成内容。${creditMsg}。弹窗提示: "${creditModal?.keyword || '未知'}"`);
-      }
-
+    if (generateApiResult && !generateApiResult.accepted) {
+      const serverMessage = `Server rejected canvas submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
       if (attempt < submitRetries) {
-        logStep(`No clear canvas success signal after submit attempt ${attemptCount}/${submitRetries + 1}. Waiting ${retryDelayMs}ms before retrying.`);
+        logStep(`${serverMessage}. Waiting ${retryDelayMs}ms before retrying.`);
         await projectPage.waitForTimeout(retryDelayMs);
-        await dismissBindingModal(projectPage);
+        await dismissBlockingOverlays(projectPage);
+        continue;
       }
+      throw new Error(serverMessage);
     }
 
-    const bodyText = await getBodyText(projectPage, 12000);
-    const summary = summarizeCanvasProjectState(bodyText);
-    const projectId = extractCanvasProjectId(projectPage.url());
-    const projectName = await getCanvasProjectName(projectPage);
-
-    logStep(`Submitted a canvas project prompt to ${projectPage.url()}`);
-    if (summary.status) {
-      logStep(`Canvas project state: ${summary.status}${summary.progressText ? ` (${summary.progressText})` : ''}`);
-    }
-
-    let registryEntry = null;
-    if (trackedRecord && resolvedTool) {
-      registryEntry = createTrackedRecordEntry(args, resolvedTool, composedPrompt, trackedRecord);
-      appendRegistryEntry(options.registryPath, registryEntry);
-      logStep(`Tracked recordId=${registryEntry.recordId}`);
-    }
-
-    maybeEmitJson(args, {
-      ok: true,
-      command: 'canvas-prompt',
-      projectId,
-      projectUrl: projectPage.url(),
-      projectTitle: await projectPage.title(),
-      projectName,
-      kind,
-      tool: resolvedTool,
+    const submitState = await waitForSubmitState(projectPage, {
+      previousIds: previousRecordIds,
       prompt: composedPrompt,
-      recordId: registryEntry?.recordId || null,
-      historyRecordId: trackedRecord?.historyRecordId || generateApiResult?.historyRecordId || null,
-      taskId: trackedRecord?.taskId || generateApiResult?.taskId || null,
-      submitId: generateApiResult?.submitId || null,
-      submitSignal,
-      pendingMarker,
-      attemptCount,
-      serverAccepted: generateApiResult?.accepted || false,
-      serverRet: generateApiResult?.ret ?? null,
-      serverErrmsg: generateApiResult?.errmsg ?? null,
-      status: summary.status,
-      progressText: summary.progressText,
-      beforeSnapshot: beforeSnapshot?.screenshot || null,
-      afterSnapshot: afterSnapshot?.screenshot || null,
-      screenshot: afterSnapshot?.screenshot || null,
-      snapshotJson: afterSnapshot?.jsonPath || null,
-      snapshotText: afterSnapshot?.textPath || null,
-      submitRequestPath,
-      registryPath: options.registryPath,
-      trackingSaved: Boolean(registryEntry),
-      registryEntry
+      tool: resolvedTool,
+      timeoutMs: Math.min(options.timeoutMs, resolvedTool === 'video' ? 30000 : 20000)
     });
-  } finally {
-    await context.close();
-  }
-}
+    await projectPage.waitForTimeout(integerFlag(args['wait-after-submit-ms'], 8000));
+    afterSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-after-submit');
 
-async function commandGenerate(args) {
-  const prompt = args.prompt;
-  if (!prompt) {
-    throw new Error('The generate command requires --prompt "..."');
-  }
-
-  const options = parseCommonOptions(args);
-  const context = await launchContext(options);
-
-  try {
-    const page = await getMainPage(context);
-    const tool = args.tool || 'image';
-    await navigateToTool(page, tool);
-    await safeNetworkIdle(page, 10000);
-    await dismissBindingModal(page);
-    if (await pageLooksLoggedOut(page)) {
-      throw new Error('JiMeng is not logged in. Run the login command before generate.');
+    if (submitState.recordCard) {
+      trackedRecord = {
+        ...submitState.recordCard,
+        historyRecordId: generateApiResult?.historyRecordId || null,
+        taskId: generateApiResult?.taskId || null
+      };
+      submitSignal = submitState.signal;
+      pendingMarker = submitState.pendingMarker || null;
+      break;
     }
 
-    if (tool === 'image') {
-      await configureImageOptions(page, args);
-    } else if (tool === 'video') {
-      await configureVideoOptions(page, args);
-    }
-
-    const {
-      genericReferenceInput,
-      uploadRequested,
-      uploadBeforePrompt,
-      needsReferenceMentions
-    } = getReferenceMentionPlan(tool, prompt, args);
-    let uploadWorked = false;
-
-    if (uploadBeforePrompt) {
-      uploadWorked = tool === 'video'
-        ? await maybeUploadVideoReferences(page, args)
-        : await maybeUploadImage(page, genericReferenceInput);
-      if (needsReferenceMentions && !uploadWorked) {
-        throw new Error(`Could not upload the ${tool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
-      }
-      if (uploadWorked && tool === 'video') {
-        await waitForVideoReferenceEditorReady(page, 10000);
-      }
-      if (uploadWorked && needsReferenceMentions) {
-        await page.waitForTimeout(5000);
-      }
-    }
-
-    const activeScope = await getActiveGeneratorRoot(page).catch(() => null) || page;
-    let promptTarget = await findPromptTarget(page, { preferRichEditor: uploadBeforePrompt, scope: activeScope });
-    if (!promptTarget) {
-      const snapshot = await maybeSaveSnapshot(page, options, `generate-missing-prompt-${tool}`);
-      throw new Error(`Could not find a visible prompt field.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
-    }
-    if (needsReferenceMentions && promptTarget.type !== 'editor') {
-      const snapshot = await maybeSaveSnapshot(page, options, `generate-missing-mention-editor-${tool}`);
-      throw new Error(`Could not find the rich-text editor needed for @ mentions.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
-    }
-
-    await fillPrompt(promptTarget, prompt, {
-      enableReferenceMentions: needsReferenceMentions
-    });
-
-    if (!uploadBeforePrompt) {
-      uploadWorked = tool === 'video'
-        ? await maybeUploadVideoReferences(page, args)
-        : await maybeUploadImage(page, genericReferenceInput);
-    }
-
-    if (uploadRequested) {
-      const uploadLabel = tool === 'video'
-        ? 'Uploaded the video reference file(s).'
-        : 'Uploaded the reference image file.';
-      const uploadMissLabel = tool === 'video'
-        ? 'Did not find a file input for the video reference upload.'
-        : 'Did not find a file input for the reference image upload.';
-      logStep(uploadWorked ? uploadLabel : uploadMissLabel);
-    }
-
-    const submitRetries = integerFlag(args['submit-retries'], tool === 'video' ? 2 : 0);
-    const retryDelayMs = integerFlag(args['submit-retry-delay-ms'], tool === 'video' ? 60000 : 15000);
-    const recordIdWaitMs = integerFlag(args['record-id-wait-ms'], tool === 'video' ? 180000 : 60000);
-    let beforeSnapshot = null;
-    let afterSnapshot = null;
-    let trackedRecord = null;
-    let submitSignal = 'no-signal';
-    let pendingMarker = null;
-    let attemptCount = 0;
-    let generateApiResult = null;
-    let submitRequestPath = null;
-
-    for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
-      attemptCount = attempt + 1;
-      const previousRecordIds = new Set((await collectLoadedRecordCards(page)).map((card) => card.recordId));
-      beforeSnapshot = await maybeSaveSnapshot(page, options, `generate-before-submit-${tool}`);
-      const submitButton = await findSubmitButton(page);
-      if (!submitButton) {
-        throw new Error(`Could not find a submit button.${beforeSnapshot ? ` Inspect ${beforeSnapshot.jsonPath}` : ''}`);
-      }
-
-      // Check for insufficient credits modal before clicking submit
-      await checkAndThrowInsufficientCredits(page);
-
-      // Close any blocking modal (safety confirmation, etc.)
-      await closeAnyModal(page);
-
-      logStep(`Clicking submit button: ${submitButton.label}`);
-      const generateApiPromise = waitForGenerateApiResult(page, Math.min(options.timeoutMs, 30000));
-      await submitButton.locator.click();
-
-      // Wait a moment and check for modals after click
-      await page.waitForTimeout(500);
-
-      // Check if a safety confirmation modal appeared and handle it
-      const modalClosed = await closeAnyModal(page);
-      if (modalClosed) {
-        // Modal was closed, wait a bit and try clicking submit again
-        await page.waitForTimeout(300);
-        await submitButton.locator.click();
-        await page.waitForTimeout(500);
-      }
-
-      await checkAndThrowInsufficientCredits(page);
-
-      generateApiResult = await generateApiPromise;
-      if (!submitRequestPath && generateApiResult?.requestBody) {
-        submitRequestPath = artifactPath(options.artifactsDir, `generate-submit-request-${tool}`, 'json');
-        fs.writeFileSync(submitRequestPath, JSON.stringify(generateApiResult.requestBody, null, 2));
-      }
-
-      if (generateApiResult && !generateApiResult.accepted) {
-        const serverMessage = `Server rejected submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
-        if (attempt < submitRetries) {
-          logStep(`${serverMessage}. Waiting ${retryDelayMs}ms before retrying.`);
-          await page.waitForTimeout(retryDelayMs);
-          await dismissBindingModal(page);
-          continue;
-        }
-        throw new Error(serverMessage);
-      }
-
-      const submitState = await waitForSubmitState(page, {
-        previousIds: previousRecordIds,
-        prompt,
-        tool,
-        timeoutMs: Math.min(options.timeoutMs, tool === 'video' ? 30000 : 20000)
+    if (submitState.signal === 'video-pending') {
+      submitSignal = submitState.signal;
+      pendingMarker = submitState.pendingMarker || null;
+      trackedRecord = await waitForDelayedRecordCard(projectPage, {
+        prompt: composedPrompt,
+        timeoutMs: Math.min(options.timeoutMs, recordIdWaitMs),
+        reloadIntervalMs: 15000
       });
-      await page.waitForTimeout(2000);
-      afterSnapshot = await maybeSaveSnapshot(page, options, `generate-after-submit-${tool}`);
-
-      if (submitState.recordCard) {
-        trackedRecord = submitState.recordCard;
-        submitSignal = submitState.signal;
-        pendingMarker = submitState.pendingMarker || null;
+      if (trackedRecord) {
+        submitSignal = 'delayed-record';
         trackedRecord = {
           ...trackedRecord,
           historyRecordId: generateApiResult?.historyRecordId || null,
           taskId: generateApiResult?.taskId || null
         };
-        break;
+      } else if (generateApiResult?.accepted) {
+        submitSignal = 'server-accepted-no-record-id';
       }
+      break;
+    }
 
-      if (submitState.signal === 'video-pending') {
-        submitSignal = submitState.signal;
-        pendingMarker = submitState.pendingMarker || null;
-        trackedRecord = await waitForDelayedRecordCard(page, {
-          prompt,
-          timeoutMs: Math.min(options.timeoutMs, recordIdWaitMs),
-          reloadIntervalMs: 15000
-        });
-        if (trackedRecord) {
-          submitSignal = 'delayed-record';
-          trackedRecord = {
-            ...trackedRecord,
-            historyRecordId: generateApiResult?.historyRecordId || null,
-            taskId: generateApiResult?.taskId || null
-          };
-        } else if (generateApiResult?.accepted) {
-          submitSignal = 'server-accepted-no-record-id';
-        }
-        break;
-      }
+    if (submitState.signal === 'insufficient-credits') {
+      const creditModal = submitState.creditModal;
+      const creditMsg = creditModal?.creditAmount
+        ? `当前积分: ${creditModal.creditAmount}`
+        : '请检查账户积分余额';
+      throw new Error(`积分不足，无法生成内容。${creditMsg}。弹窗提示: "${creditModal?.keyword || '未知'}"`);
+    }
 
-      if (submitState.signal === 'insufficient-credits') {
-        const creditModal = submitState.creditModal;
-        const creditMsg = creditModal?.creditAmount
-          ? `当前积分: ${creditModal.creditAmount}`
-          : '请检查账户积分余额';
-        throw new Error(`积分不足，无法生成内容。${creditMsg}。弹窗提示: "${creditModal?.keyword || '未知'}"`);
-      }
+    if (attempt < submitRetries) {
+      logStep(`No clear canvas success signal after submit attempt ${attemptCount}/${submitRetries + 1}. Waiting ${retryDelayMs}ms before retrying.`);
+      await projectPage.waitForTimeout(retryDelayMs);
+      await dismissBlockingOverlays(projectPage);
+    }
+  }
 
+  const bodyText = await getBodyText(projectPage, 12000);
+  const summary = summarizeCanvasProjectState(bodyText);
+  const projectId = extractCanvasProjectId(projectPage.url());
+  const projectName = await getCanvasProjectName(projectPage);
+
+  logStep(`Submitted a canvas project prompt to ${projectPage.url()}`);
+  if (summary.status) {
+    logStep(`Canvas project state: ${summary.status}${summary.progressText ? ` (${summary.progressText})` : ''}`);
+  }
+
+  let registryEntry = null;
+  if (trackedRecord && resolvedTool) {
+    registryEntry = createTrackedRecordEntry(args, resolvedTool, composedPrompt, trackedRecord);
+    appendRegistryEntry(options.registryPath, registryEntry);
+    logStep(`Tracked recordId=${registryEntry.recordId}`);
+  }
+
+  return {
+    ok: true,
+    command: 'canvas-prompt',
+    projectId,
+    projectUrl: projectPage.url(),
+    projectTitle: await projectPage.title(),
+    projectName,
+    kind,
+    tool: resolvedTool,
+    prompt: composedPrompt,
+    recordId: registryEntry?.recordId || null,
+    historyRecordId: trackedRecord?.historyRecordId || generateApiResult?.historyRecordId || null,
+    taskId: trackedRecord?.taskId || generateApiResult?.taskId || null,
+    submitId: generateApiResult?.submitId || null,
+    submitSignal,
+    pendingMarker,
+    attemptCount,
+    serverAccepted: generateApiResult?.accepted || false,
+    serverRet: generateApiResult?.ret ?? null,
+    serverErrmsg: generateApiResult?.errmsg ?? null,
+    status: summary.status,
+    progressText: summary.progressText,
+    beforeSnapshot: beforeSnapshot?.screenshot || null,
+    afterSnapshot: afterSnapshot?.screenshot || null,
+    screenshot: afterSnapshot?.screenshot || null,
+    snapshotJson: afterSnapshot?.jsonPath || null,
+    snapshotText: afterSnapshot?.textPath || null,
+    submitRequestPath,
+    registryPath: options.registryPath,
+    trackingSaved: Boolean(registryEntry),
+    registryEntry
+  };
+}
+
+async function commandCanvasPrompt(args) {
+  const options = parseCommonOptions(args);
+  const context = await launchContext(options);
+
+  try {
+    const payload = await executeCanvasPrompt(args, options, context);
+    maybeEmitJson(args, payload);
+  } finally {
+    await context.close();
+  }
+}
+
+async function executeGenerate(args, options, context, runtime = {}) {
+  const prompt = args.prompt;
+  if (!prompt) {
+    throw new Error('The generate command requires --prompt "..."');
+  }
+
+  const page = runtime.page
+    || (runtime.daemonState?.mainPage && !runtime.daemonState.mainPage.isClosed() ? runtime.daemonState.mainPage : null)
+    || await getMainPage(context);
+  if (runtime.daemonState) {
+    runtime.daemonState.mainPage = page;
+    await resetReusablePage(page, 'generate');
+  }
+
+  const tool = args.tool || 'image';
+  await navigateToTool(page, tool);
+  await safeNetworkIdle(page, 10000);
+  await dismissBlockingOverlays(page);
+  if (await pageLooksLoggedOut(page)) {
+    throw new Error('JiMeng is not logged in. Run the login command before generate.');
+  }
+
+  if (tool === 'image') {
+    await configureImageOptions(page, args);
+  } else if (tool === 'video') {
+    await configureVideoOptions(page, args);
+  }
+
+  const {
+    genericReferenceInput,
+    uploadRequested,
+    uploadBeforePrompt,
+    needsReferenceMentions
+  } = getReferenceMentionPlan(tool, prompt, args);
+  let uploadWorked = false;
+
+  if (uploadBeforePrompt) {
+    uploadWorked = tool === 'video'
+      ? await maybeUploadVideoReferences(page, args)
+      : await maybeUploadImage(page, genericReferenceInput);
+    if (needsReferenceMentions && !uploadWorked) {
+      throw new Error(`Could not upload the ${tool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
+    }
+    if (uploadWorked && tool === 'video') {
+      await waitForVideoReferenceEditorReady(page, 10000);
+    }
+    if (uploadWorked && needsReferenceMentions) {
+      await page.waitForTimeout(5000);
+    }
+  }
+
+  const activeScope = await getActiveGeneratorRoot(page).catch(() => null) || page;
+  let promptTarget = await findPromptTarget(page, { preferRichEditor: uploadBeforePrompt, scope: activeScope });
+  if (!promptTarget) {
+    const snapshot = await maybeSaveSnapshot(page, options, `generate-missing-prompt-${tool}`);
+    throw new Error(`Could not find a visible prompt field.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
+  }
+  if (needsReferenceMentions && promptTarget.type !== 'editor') {
+    const snapshot = await maybeSaveSnapshot(page, options, `generate-missing-mention-editor-${tool}`);
+    throw new Error(`Could not find the rich-text editor needed for @ mentions.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
+  }
+
+  await fillPrompt(promptTarget, prompt, {
+    enableReferenceMentions: needsReferenceMentions
+  });
+
+  if (!uploadBeforePrompt) {
+    uploadWorked = tool === 'video'
+      ? await maybeUploadVideoReferences(page, args)
+      : await maybeUploadImage(page, genericReferenceInput);
+  }
+
+  if (uploadRequested) {
+    const uploadLabel = tool === 'video'
+      ? 'Uploaded the video reference file(s).'
+      : 'Uploaded the reference image file.';
+    const uploadMissLabel = tool === 'video'
+      ? 'Did not find a file input for the video reference upload.'
+      : 'Did not find a file input for the reference image upload.';
+    logStep(uploadWorked ? uploadLabel : uploadMissLabel);
+  }
+
+  const submitRetries = integerFlag(args['submit-retries'], tool === 'video' ? 2 : 0);
+  const retryDelayMs = integerFlag(args['submit-retry-delay-ms'], tool === 'video' ? 60000 : 15000);
+  const recordIdWaitMs = integerFlag(args['record-id-wait-ms'], tool === 'video' ? 180000 : 60000);
+  let beforeSnapshot = null;
+  let afterSnapshot = null;
+  let trackedRecord = null;
+  let submitSignal = 'no-signal';
+  let pendingMarker = null;
+  let attemptCount = 0;
+  let generateApiResult = null;
+  let submitRequestPath = null;
+
+  for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
+    attemptCount = attempt + 1;
+    const previousRecordIds = new Set((await collectLoadedRecordCards(page)).map((card) => card.recordId));
+    beforeSnapshot = await maybeSaveSnapshot(page, options, `generate-before-submit-${tool}`);
+    const submitButton = await findSubmitButton(page);
+    if (!submitButton) {
+      throw new Error(`Could not find a submit button.${beforeSnapshot ? ` Inspect ${beforeSnapshot.jsonPath}` : ''}`);
+    }
+
+    await checkAndThrowInsufficientCredits(page);
+    await closeAnyModal(page);
+
+    logStep(`Clicking submit button: ${submitButton.label}`);
+    const generateApiPromise = waitForGenerateApiResult(page, Math.min(options.timeoutMs, 30000));
+    await submitButton.locator.click();
+    await page.waitForTimeout(500);
+
+    const modalClosed = await closeAnyModal(page);
+    if (modalClosed) {
+      await page.waitForTimeout(300);
+      await submitButton.locator.click();
+      await page.waitForTimeout(500);
+    }
+
+    await checkAndThrowInsufficientCredits(page);
+
+    generateApiResult = await generateApiPromise;
+    if (!submitRequestPath && generateApiResult?.requestBody) {
+      submitRequestPath = artifactPath(options.artifactsDir, `generate-submit-request-${tool}`, 'json');
+      fs.writeFileSync(submitRequestPath, JSON.stringify(generateApiResult.requestBody, null, 2));
+    }
+
+    if (generateApiResult && !generateApiResult.accepted) {
+      const serverMessage = `Server rejected submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
       if (attempt < submitRetries) {
-        logStep(`No clear success signal after submit attempt ${attemptCount}/${submitRetries + 1}. Waiting ${retryDelayMs}ms before retrying.`);
+        logStep(`${serverMessage}. Waiting ${retryDelayMs}ms before retrying.`);
         await page.waitForTimeout(retryDelayMs);
-        await dismissBindingModal(page);
+        await dismissBlockingOverlays(page);
+        continue;
       }
+      throw new Error(serverMessage);
     }
 
-    if (beforeSnapshot) {
-      logStep(`Saved the pre-submit snapshot: ${beforeSnapshot.screenshot}`);
-    }
-    if (afterSnapshot) {
-      logStep(`Saved the post-submit snapshot: ${afterSnapshot.screenshot}`);
-    }
-
-    let resultPayload = {
-      ok: true,
-      command: 'generate',
-      tool,
+    const submitState = await waitForSubmitState(page, {
+      previousIds: previousRecordIds,
       prompt,
-      recordId: null,
-      expectedImageCount: tool === 'image' ? 4 : null,
-      expectedVideoCount: tool === 'video' ? 1 : null,
-      beforeSnapshot: beforeSnapshot.screenshot,
-      afterSnapshot: afterSnapshot.screenshot,
-      registryPath: options.registryPath,
-      trackingSaved: false,
-      submitSignal,
-      pendingMarker,
-      attemptCount,
-      serverAccepted: generateApiResult?.accepted || false,
-      historyRecordId: generateApiResult?.historyRecordId || null,
-      taskId: generateApiResult?.taskId || null,
-      submitId: generateApiResult?.submitId || null,
-      serverRet: generateApiResult?.ret ?? null,
-      serverErrmsg: generateApiResult?.errmsg ?? null,
-      serverHttpStatus: generateApiResult?.httpStatus ?? null,
-      serverStatus: generateApiResult?.serverStatus ?? null,
-      submitRequestPath
-    };
+      tool,
+      timeoutMs: Math.min(options.timeoutMs, tool === 'video' ? 30000 : 20000)
+    });
+    await page.waitForTimeout(2000);
+    afterSnapshot = await maybeSaveSnapshot(page, options, `generate-after-submit-${tool}`);
 
-    if (trackedRecord) {
-      const registryEntry = createTrackedRecordEntry(args, tool, prompt, trackedRecord);
-      appendRegistryEntry(options.registryPath, registryEntry);
-      logStep(`Tracked recordId=${registryEntry.recordId}${registryEntry.characterId ? ` characterId=${registryEntry.characterId}` : ''}`);
-      logStep(`Registry entry saved: ${options.registryPath}`);
-      resultPayload = {
-        ...resultPayload,
-        recordId: registryEntry.recordId,
-        status: registryEntry.status,
-        trackingSaved: true,
-        registryEntry
+    if (submitState.recordCard) {
+      trackedRecord = submitState.recordCard;
+      submitSignal = submitState.signal;
+      pendingMarker = submitState.pendingMarker || null;
+      trackedRecord = {
+        ...trackedRecord,
+        historyRecordId: generateApiResult?.historyRecordId || null,
+        taskId: generateApiResult?.taskId || null
       };
-    } else {
-      if (generateApiResult?.accepted) {
-        logStep(`Server accepted the submit, but no JiMeng record card appeared before the timeout. historyRecordId=${generateApiResult.historyRecordId || '-'} taskId=${generateApiResult.taskId || '-'}`);
-      } else {
-        logStep('Submit state stayed ambiguous and no new record card appeared before the timeout. Inspect the post-submit snapshot.');
-      }
-      resultPayload = {
-        ...resultPayload,
-        status: generateApiResult?.accepted ? 'server-accepted-no-record-id' : 'submitted-no-record-id'
-      };
+      break;
     }
 
-    maybeEmitJson(args, resultPayload);
+    if (submitState.signal === 'video-pending') {
+      submitSignal = submitState.signal;
+      pendingMarker = submitState.pendingMarker || null;
+      trackedRecord = await waitForDelayedRecordCard(page, {
+        prompt,
+        timeoutMs: Math.min(options.timeoutMs, recordIdWaitMs),
+        reloadIntervalMs: 15000
+      });
+      if (trackedRecord) {
+        submitSignal = 'delayed-record';
+        trackedRecord = {
+          ...trackedRecord,
+          historyRecordId: generateApiResult?.historyRecordId || null,
+          taskId: generateApiResult?.taskId || null
+        };
+      } else if (generateApiResult?.accepted) {
+        submitSignal = 'server-accepted-no-record-id';
+      }
+      break;
+    }
+
+    if (submitState.signal === 'insufficient-credits') {
+      const creditModal = submitState.creditModal;
+      const creditMsg = creditModal?.creditAmount
+        ? `当前积分: ${creditModal.creditAmount}`
+        : '请检查账户积分余额';
+      throw new Error(`积分不足，无法生成内容。${creditMsg}。弹窗提示: "${creditModal?.keyword || '未知'}"`);
+    }
+
+    if (attempt < submitRetries) {
+      logStep(`No clear success signal after submit attempt ${attemptCount}/${submitRetries + 1}. Waiting ${retryDelayMs}ms before retrying.`);
+      await page.waitForTimeout(retryDelayMs);
+      await dismissBlockingOverlays(page);
+    }
+  }
+
+  if (beforeSnapshot) {
+    logStep(`Saved the pre-submit snapshot: ${beforeSnapshot.screenshot}`);
+  }
+  if (afterSnapshot) {
+    logStep(`Saved the post-submit snapshot: ${afterSnapshot.screenshot}`);
+  }
+
+  let resultPayload = {
+    ok: true,
+    command: 'generate',
+    tool,
+    prompt,
+    recordId: null,
+    expectedImageCount: tool === 'image' ? 4 : null,
+    expectedVideoCount: tool === 'video' ? 1 : null,
+    beforeSnapshot: beforeSnapshot?.screenshot || null,
+    afterSnapshot: afterSnapshot?.screenshot || null,
+    registryPath: options.registryPath,
+    trackingSaved: false,
+    submitSignal,
+    pendingMarker,
+    attemptCount,
+    serverAccepted: generateApiResult?.accepted || false,
+    historyRecordId: generateApiResult?.historyRecordId || null,
+    taskId: generateApiResult?.taskId || null,
+    submitId: generateApiResult?.submitId || null,
+    serverRet: generateApiResult?.ret ?? null,
+    serverErrmsg: generateApiResult?.errmsg ?? null,
+    serverHttpStatus: generateApiResult?.httpStatus ?? null,
+    serverStatus: generateApiResult?.serverStatus ?? null,
+    submitRequestPath
+  };
+
+  if (trackedRecord) {
+    const registryEntry = createTrackedRecordEntry(args, tool, prompt, trackedRecord);
+    appendRegistryEntry(options.registryPath, registryEntry);
+    logStep(`Tracked recordId=${registryEntry.recordId}${registryEntry.characterId ? ` characterId=${registryEntry.characterId}` : ''}`);
+    logStep(`Registry entry saved: ${options.registryPath}`);
+    resultPayload = {
+      ...resultPayload,
+      recordId: registryEntry.recordId,
+      status: registryEntry.status,
+      trackingSaved: true,
+      registryEntry
+    };
+  } else {
+    if (generateApiResult?.accepted) {
+      logStep(`Server accepted the submit, but no JiMeng record card appeared before the timeout. historyRecordId=${generateApiResult.historyRecordId || '-'} taskId=${generateApiResult.taskId || '-'}`);
+    } else {
+      logStep('Submit state stayed ambiguous and no new record card appeared before the timeout. Inspect the post-submit snapshot.');
+    }
+    resultPayload = {
+      ...resultPayload,
+      status: generateApiResult?.accepted ? 'server-accepted-no-record-id' : 'submitted-no-record-id'
+    };
+  }
+
+  return resultPayload;
+}
+
+async function commandGenerate(args) {
+  const options = parseCommonOptions(args);
+  const context = await launchContext(options);
+
+  try {
+    const payload = await executeGenerate(args, options, context);
+    maybeEmitJson(args, payload);
   } finally {
     await context.close();
   }
@@ -4221,6 +4792,134 @@ async function commandDownloadRecord(args) {
   }
 }
 
+async function executeDaemonCommand(state, request) {
+  const args = request.args || {};
+  if (request.command === 'generate' && !args.prompt) {
+    throw new Error('The generate command requires --prompt "..."');
+  }
+  if (request.command === 'canvas-prompt' && !args.prompt) {
+    throw new Error('The canvas-prompt command requires --prompt "..."');
+  }
+  const options = parseCommonOptions(args);
+  const context = await ensureDaemonSession(state, options, args);
+
+  switch (request.command) {
+    case 'generate':
+      return executeGenerate(args, options, context, { daemonState: state });
+    case 'canvas-prompt':
+      return executeCanvasPrompt(args, options, context, { daemonState: state });
+    case 'canvas-create-project':
+      return executeCanvasCreateProject(options, context, { daemonState: state });
+    case 'canvas-open-project':
+      return executeCanvasOpenProject(args, options, context, { daemonState: state });
+    case 'canvas-rename-project':
+      return executeCanvasRenameProject(args, options, context, { daemonState: state });
+    default:
+      throw new Error(`Unsupported daemon command: ${request.command}`);
+  }
+}
+
+async function commandDaemon(args) {
+  const options = parseCommonOptions(args);
+  const socketPath = path.resolve(args['socket-path'] || getDaemonSocketPath(buildDaemonSignature(options, args)));
+  const state = createDaemonState();
+  state.idleTimeoutMs = getDaemonIdleTimeoutMs(args);
+  let shuttingDown = false;
+
+  ensureDir(path.dirname(socketPath));
+  removeFileIfExists(socketPath);
+
+  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+    let buffer = '';
+    let handled = false;
+
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      if (handled || !buffer.includes('\n')) {
+        return;
+      }
+      handled = true;
+      state.queue = state.queue.then(async () => {
+        try {
+          const [line] = buffer.split('\n');
+          const request = JSON.parse(line.trim() || '{}');
+          if (request.type === 'ping') {
+            socket.end(`${JSON.stringify({ ok: true, pong: true, logs: [] })}\n`);
+            return;
+          }
+          if (request.type !== 'command') {
+            socket.end(`${JSON.stringify({ ok: false, error: `Unsupported daemon request type: ${request.type}`, logs: [] })}\n`);
+            return;
+          }
+
+          clearTimeout(state.idleTimer);
+          state.idleTimer = null;
+          const { result, logs } = await withCapturedLogs(
+            () => executeDaemonCommand(state, request),
+            { silent: true }
+          );
+          scheduleDaemonIdleShutdown(state);
+          socket.end(`${JSON.stringify({ ok: true, payload: result, logs })}\n`);
+        } catch (error) {
+          scheduleDaemonIdleShutdown(state);
+          socket.end(`${JSON.stringify({ ok: false, error: error.message, logs: error.capturedLogs || [] })}\n`);
+        }
+      }).catch(() => null);
+    });
+
+    socket.on('error', () => null);
+  });
+
+  const shutdown = async () => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+    await closeDaemonSession(state);
+    await new Promise((resolve) => server.close(resolve));
+    removeFileIfExists(socketPath);
+  };
+
+  state.onIdle = async () => {
+    await shutdown();
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => {
+    shutdown().finally(() => process.exit(0));
+  });
+  process.on('SIGINT', () => {
+    shutdown().finally(() => process.exit(0));
+  });
+  process.on('exit', () => {
+    removeFileIfExists(socketPath);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', (error) => {
+      const code = error?.code || '';
+      if (code === 'EADDRINUSE') {
+        reject(new Error(`Daemon socket already in use at ${socketPath}. Another daemon may be running. If not, delete the stale socket file and retry.`));
+      } else {
+        reject(new Error(`Daemon failed to listen on ${socketPath} (${code || 'unknown'}): ${error.message}`));
+      }
+    });
+    server.listen(socketPath, () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+
+  server.on('error', (error) => {
+    process.stderr.write(`[jimeng-daemon] Server error: ${error.message}\n`);
+  });
+
+  scheduleDaemonIdleShutdown(state);
+  await new Promise(() => null);
+}
+
 function printUsage() {
   console.log(`Usage:
   node scripts/jimeng-browser.js login [--headless true|false] [--timeout-ms 180000]
@@ -4269,6 +4968,8 @@ Optional flags:
   --poll-interval-ms 15000
   --output-dir /abs/path
   --reference-file /abs/path[,/abs/path2]
+  --no-daemon true|false
+  --daemon-idle-timeout-ms 120000
   In 全能参考 mode, uploaded references can be mentioned in --prompt as @图片1, @图片2, @视频1, @音频1
   --image-file /abs/path[,/abs/path2]`);
 }
@@ -4278,7 +4979,14 @@ async function main() {
   const args = parseArgs(rest);
   setJsonOutput(boolFlag(args.json, false));
 
+  if (await maybeRunViaDaemon(command, args)) {
+    return;
+  }
+
   switch (command) {
+    case 'daemon':
+      await commandDaemon(args);
+      return;
     case 'login':
       await commandLogin(args);
       return;
