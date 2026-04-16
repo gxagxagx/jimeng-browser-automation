@@ -408,20 +408,6 @@ async function detectInsufficientCreditsModal(page) {
   return null;
 }
 
-async function dismissInsufficientCreditsModal(page) {
-  const modalInfo = await detectInsufficientCreditsModal(page);
-  if (!modalInfo) {
-    return null;
-  }
-
-  // Try to close the modal
-  if (modalInfo.closeButton) {
-    await modalInfo.closeButton.click({ force: true });
-    await page.waitForTimeout(400);
-  }
-
-  return modalInfo;
-}
 
 async function checkAndThrowInsufficientCredits(page) {
   const modalInfo = await detectInsufficientCreditsModal(page);
@@ -571,21 +557,6 @@ async function collectLoadedRecordCards(page, limit = 80) {
   return items;
 }
 
-async function waitForNewRecordCard(page, previousIds, timeoutMs) {
-  const started = Date.now();
-
-  while (Date.now() - started < timeoutMs) {
-    const cards = await collectLoadedRecordCards(page);
-    const freshCard = cards.find((card) => !previousIds.has(card.recordId));
-    if (freshCard) {
-      return freshCard;
-    }
-
-    await page.waitForTimeout(1200);
-  }
-
-  return null;
-}
 
 function promptFingerprint(prompt, maxLength = 36) {
   return normalizeWhitespace(prompt).slice(0, maxLength);
@@ -1847,12 +1818,8 @@ function normalizeCanvasKind(value) {
   return 'auto';
 }
 
-function buildCanvasPrompt(kind, prompt) {
-  const trimmed = String(prompt || '').trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-  return trimmed;
+function buildCanvasPrompt(prompt) {
+  return String(prompt || '').trim();
 }
 
 async function dismissCanvasOnboarding(page) {
@@ -1878,7 +1845,7 @@ async function openCanvasHome(page) {
   return page;
 }
 
-async function clickAndWaitForPopup(page, context, locator, description, timeoutMs) {
+async function clickAndWaitForPopup(context, locator, description, timeoutMs) {
   const existingPages = new Set(context.pages());
   await locator.click({ force: true });
   const popup = await waitForNewPage(context, existingPages, timeoutMs, description);
@@ -1913,7 +1880,7 @@ async function openCanvasProjectFromList(page, context, projectName, projectInde
     throw new Error(`Found ${visible.length} visible canvas project(s) named ${projectName}, but project-index ${projectIndex} is out of range.`);
   }
 
-  return clickAndWaitForPopup(page, context, target, 'canvas project window', timeoutMs);
+  return clickAndWaitForPopup(context, target, 'canvas project window', timeoutMs);
 }
 
 async function createCanvasProjectFromHome(page, context, timeoutMs) {
@@ -1921,7 +1888,7 @@ async function createCanvasProjectFromHome(page, context, timeoutMs) {
   if (!(await isVisible(button))) {
     throw new Error('Could not find the 新建项目 button on the canvas home page.');
   }
-  return clickAndWaitForPopup(page, context, button, 'new canvas project window', timeoutMs);
+  return clickAndWaitForPopup(context, button, 'new canvas project window', timeoutMs);
 }
 
 async function resolveCanvasProjectPage(page, context, args, options) {
@@ -2593,32 +2560,42 @@ async function chooseVisibleSelectOption(page, optionText, matchText = null) {
     visibleSelects.push({ locator: current, text, box });
   }
 
-  const target = matchText
-    ? visibleSelects.find((item) => item.text.includes(matchText))
-    : visibleSelects[0];
-  const resolvedTarget = target || visibleSelects[0] || null;
+  // When matchText is given, prefer the combobox whose current text includes matchText.
+  // When matchText is null, try every visible combobox until one has the target option in its popup.
+  const prioritized = matchText
+    ? [
+        visibleSelects.find((item) => item.text.includes(matchText)),
+        ...visibleSelects.filter((item) => !item.text.includes(matchText))
+      ].filter(Boolean)
+    : visibleSelects;
 
-  if (!resolvedTarget) {
+  if (!prioritized.length) {
     return false;
   }
 
-  const popupOpened = await openSelectPopup(page, resolvedTarget.locator);
-  if (!popupOpened) {
-    return false;
-  }
-
-  const options = getSelectPopupOptions(page);
-  const optionCount = await options.count().catch(() => 0);
-  for (let i = 0; i < optionCount; i += 1) {
-    const current = options.nth(i);
-    const text = normalizeWhitespace(await current.innerText().catch(() => ''));
-    const firstLine = text.split('\n')[0].trim();
-    if (text !== optionText && firstLine !== optionText) {
+  for (const candidate of prioritized) {
+    const popupOpened = await openSelectPopup(page, candidate.locator);
+    if (!popupOpened) {
       continue;
     }
-    await current.evaluate((node) => node.click()).catch(() => null);
-    await page.waitForTimeout(500);
-    return true;
+
+    const options = getSelectPopupOptions(page);
+    const optionCount = await options.count().catch(() => 0);
+    for (let i = 0; i < optionCount; i += 1) {
+      const current = options.nth(i);
+      const text = normalizeWhitespace(await current.innerText().catch(() => ''));
+      const firstLine = text.split('\n')[0].trim();
+      if (text !== optionText && firstLine !== optionText) {
+        continue;
+      }
+      await current.evaluate((node) => node.click()).catch(() => null);
+      await page.waitForTimeout(500);
+      return true;
+    }
+
+    // This combobox didn't have the option — close popup and try the next one
+    await page.keyboard.press('Escape').catch(() => null);
+    await page.waitForTimeout(200);
   }
 
   return false;
@@ -3221,7 +3198,7 @@ async function commandCanvasPrompt(args) {
       }
     }
 
-    const composedPrompt = buildCanvasPrompt(kind, prompt);
+    const composedPrompt = buildCanvasPrompt(prompt);
     if (!resolvedTool) {
       if (projectPage.url().includes('type=video')) {
         resolvedTool = 'video';
