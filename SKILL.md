@@ -42,7 +42,7 @@ npx playwright install chromium
 - `横屏` -> usually `--aspect 16:9`
 - `5 秒视频` -> `--duration 5s`
 - `12 秒视频` -> `--duration 12s`
-- `高清 2K` / `1080P` -> `--resolution ...`
+- `高清 2K` / `超清 4K` (image only) -> `--resolution 高清 2K` / `--resolution 超清 4K`
 - `首尾帧过渡` -> `--reference-mode 首尾帧 --first-frame-file ... --last-frame-file ...`
 
 ## Minimal interface
@@ -211,7 +211,6 @@ Behavior:
 - One video task produces `1` MP4.
 - For hot models, inspect `serverAccepted`, `historyRecordId`, `serverRet`, and `serverErrmsg`.
 - JiMeng can accept a task before the history card appears. `serverAccepted=true` with no `recordId` is accepted, not a hard failure.
-- Resolution availability is dynamic. Not every model, aspect ratio, and reference-mode combination exposes the same resolution.
 - For `Seedance 2.0 Fast VIP`, `Seedance 2.0 VIP`, `Seedance 2.0 Fast`, and `Seedance 2.0`, prefer:
 
 ```bash

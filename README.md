@@ -192,7 +192,7 @@ Good examples:
 
 - `竖屏` -> `--aspect 9:16`
 - `12 秒视频` -> `--duration 12s`
-- `1080P` -> `--resolution 1080P`
+- `超清 4K` (image only) -> `--resolution 超清 4K`
 - `首尾帧过渡` -> `--reference-mode 首尾帧`
 
 Keep the prompt focused on content:
