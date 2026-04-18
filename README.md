@@ -110,14 +110,40 @@ node scripts/jimeng-browser.js canvas-prompt \
 
 ## Normal workflow
 
+### Image
+
 1. `login`
-2. `generate`
-3. `record-status`
-4. `download-record`
+2. `generate --tool image` — returns `recordId` quickly
+3. `download-record --wait-complete true` — waits internally and downloads
+
+### Video
+
+Video generation can queue for minutes to hours. Use the async workflow:
+
+1. `login`
+2. `generate --tool video` — submits and returns `recordId` immediately
+3. `record-status --record-id <id>` — poll until `isComplete=true`
+4. `download-record --record-id <id>` — download once complete
 
 Use `cancel-record` only for queued video tasks you want to stop.
 
 Always track tasks by `record-id`, not by page order.
+
+## Daemon
+
+Most commands reuse a background browser daemon so repeated calls skip the
+browser cold-start cost. The daemon starts automatically on the first call and
+shuts itself down after 10 minutes of idle time. No manual management needed.
+
+Commands that go through the daemon:
+`generate`, `canvas-prompt`, `canvas-create-project`, `canvas-open-project`,
+`canvas-rename-project`, `record-status`, `find-record`
+
+`record-status` and `find-record` use a dedicated page inside the daemon so
+they never interfere with the generate/canvas page that is being kept warm.
+
+To opt out: `--no-daemon true`
+To change the idle timeout: `--daemon-idle-timeout-ms <ms>`
 
 For canvas projects:
 

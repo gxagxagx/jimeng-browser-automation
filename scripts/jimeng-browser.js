@@ -11,8 +11,8 @@ const RUNTIME_DIR = path.join(ROOT, 'runtime');
 const DEFAULT_USER_DATA_DIR = path.join(RUNTIME_DIR, 'jimeng-profile');
 const DEFAULT_ARTIFACTS_DIR = path.join(RUNTIME_DIR, 'artifacts');
 const DEFAULT_REGISTRY_PATH = path.join(RUNTIME_DIR, 'tracked-records.jsonl');
-const DEFAULT_DAEMON_IDLE_TIMEOUT_MS = 180000;
-const DAEMON_COMPATIBLE_COMMANDS = new Set(['generate', 'canvas-prompt', 'canvas-create-project', 'canvas-open-project', 'canvas-rename-project']);
+const DEFAULT_DAEMON_IDLE_TIMEOUT_MS = 600000;
+const DAEMON_COMPATIBLE_COMMANDS = new Set(['generate', 'canvas-prompt', 'canvas-create-project', 'canvas-open-project', 'canvas-rename-project', 'record-status', 'find-record']);
 const TOOL_URLS = {
   home: 'https://jimeng.jianying.com/ai-tool/home',
   image: 'https://jimeng.jianying.com/ai-tool/generate/?type=image',
@@ -522,6 +522,7 @@ function createDaemonState() {
     context: null,
     mainPage: null,
     canvasProjectPage: null,
+    statusPage: null,
     sessionSignature: null,
     idleTimer: null,
     queue: Promise.resolve(),
@@ -539,6 +540,7 @@ async function closeDaemonSession(state) {
   state.context = null;
   state.mainPage = null;
   state.canvasProjectPage = null;
+  state.statusPage = null;
   state.sessionSignature = null;
 }
 
@@ -560,9 +562,20 @@ async function ensureDaemonSession(state, options, args) {
   if (state.canvasProjectPage && state.canvasProjectPage.isClosed()) {
     state.canvasProjectPage = null;
   }
+  if (state.statusPage && state.statusPage.isClosed()) {
+    state.statusPage = null;
+  }
 
   state.idleTimeoutMs = getDaemonIdleTimeoutMs(args);
   return state.context;
+}
+
+async function ensureDaemonStatusPage(state, context) {
+  if (!state.statusPage || state.statusPage.isClosed()) {
+    state.statusPage = await context.newPage();
+    logStep('Opened a dedicated status page for record lookups.');
+  }
+  return state.statusPage;
 }
 
 function scheduleDaemonIdleShutdown(state) {
@@ -4312,8 +4325,7 @@ async function commandListRecords(args) {
   });
 }
 
-async function commandRecordStatus(args) {
-  const options = parseCommonOptions(args);
+async function executeRecordStatus(args, options, context, runtime = {}) {
   const trackedEntry = selectTrackedEntry(loadRegistryEntries(options.registryPath), args);
 
   if (!trackedEntry && !args['record-id']) {
@@ -4343,43 +4355,48 @@ async function commandRecordStatus(args) {
     ].join(' ')
   );
 
+  const page = runtime.page || await getMainPage(context);
+  const toolCandidates = buildToolCandidates(target.tool || args.tool || null);
+  const located = await locateRecordAcrossTools(page, target.recordId, toolCandidates);
+  const historyEntry = await fetchHistoryEntry(page, target.recordId).catch(() => null);
+  const tool = inferToolFromHistoryEntry(historyEntry) || located.tool;
+
+  if (!located.record && !historyEntry) {
+    const snapshot = await maybeSaveSnapshot(page, options, `record-status-${safeSlug(target.recordId)}`);
+    throw new Error(`Could not find record ${target.recordId}.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
+  }
+
+  const summary = summarizeRecordStatus(target.recordId, tool, located.record, historyEntry);
+  logStep(`recordId=${summary.recordId} tool=${summary.tool} status=${summary.status || '-'} source=${summary.source}`);
+  if (summary.progressPercent !== null) {
+    logStep(`progressPercent=${summary.progressPercent}`);
+  }
+  if (summary.queuePosition !== null || summary.queueTotal !== null || summary.etaText) {
+    logStep(
+      [
+        `queue=${summary.queuePosition ?? '-'}/${summary.queueTotal ?? '-'}`,
+        `eta=${summary.etaText || '-'}`
+      ].join(' ')
+    );
+  }
+  if (summary.auditFailureType || summary.failureReason) {
+    logStep(
+      [
+        `auditFailureType=${summary.auditFailureType || '-'}`,
+        `auditFailurePhase=${summary.auditFailurePhase || '-'}`,
+        `reason=${summary.failureReason || '-'}`
+      ].join(' ')
+    );
+  }
+
+  return summary;
+}
+
+async function commandRecordStatus(args) {
+  const options = parseCommonOptions(args);
   const context = await launchContext(options);
-
   try {
-    const page = await getMainPage(context);
-    const toolCandidates = buildToolCandidates(target.tool || args.tool || null);
-    const located = await locateRecordAcrossTools(page, target.recordId, toolCandidates);
-    const historyEntry = await fetchHistoryEntry(page, target.recordId).catch(() => null);
-    const tool = inferToolFromHistoryEntry(historyEntry) || located.tool;
-
-    if (!located.record && !historyEntry) {
-      const snapshot = await maybeSaveSnapshot(page, options, `record-status-${safeSlug(target.recordId)}`);
-      throw new Error(`Could not find record ${target.recordId}.${snapshot ? ` Inspect ${snapshot.jsonPath}` : ''}`);
-    }
-
-    const summary = summarizeRecordStatus(target.recordId, tool, located.record, historyEntry);
-    logStep(`recordId=${summary.recordId} tool=${summary.tool} status=${summary.status || '-'} source=${summary.source}`);
-    if (summary.progressPercent !== null) {
-      logStep(`progressPercent=${summary.progressPercent}`);
-    }
-    if (summary.queuePosition !== null || summary.queueTotal !== null || summary.etaText) {
-      logStep(
-        [
-          `queue=${summary.queuePosition ?? '-'}/${summary.queueTotal ?? '-'}`,
-          `eta=${summary.etaText || '-'}`
-        ].join(' ')
-      );
-    }
-    if (summary.auditFailureType || summary.failureReason) {
-      logStep(
-        [
-          `auditFailureType=${summary.auditFailureType || '-'}`,
-          `auditFailurePhase=${summary.auditFailurePhase || '-'}`,
-          `reason=${summary.failureReason || '-'}`
-        ].join(' ')
-      );
-    }
-
+    const summary = await executeRecordStatus(args, options, context);
     maybeEmitJson(args, summary);
   } finally {
     await context.close();
@@ -4511,8 +4528,7 @@ async function commandCancelRecord(args) {
   }
 }
 
-async function commandFindRecord(args) {
-  const options = parseCommonOptions(args);
+async function executeFindRecord(args, options, context, runtime = {}) {
   const trackedEntry = selectTrackedEntry(loadRegistryEntries(options.registryPath), args);
 
   if (!trackedEntry && !args['record-id']) {
@@ -4542,76 +4558,79 @@ async function commandFindRecord(args) {
     ].join(' ')
   );
 
-  const context = await launchContext(options);
-
-  try {
-    const page = await getMainPage(context);
-    const toolCandidates = buildToolCandidates(target.tool || args.tool || null);
-    const located = await locateRecordAcrossTools(page, target.recordId, toolCandidates);
-    const locator = located.record?.locator || null;
-    if (!locator) {
-      const historyEntry = await fetchHistoryEntry(page, target.recordId).catch(() => null);
-      if (historyEntry) {
-        const resolvedTool = inferToolFromHistoryEntry(historyEntry) || located.tool;
-        const historyStatus = historyEntryStatusLabel(historyEntry) || '-';
-        const historyPath = artifactPath(options.artifactsDir, `find-record-${safeSlug(target.recordId)}-history`, 'json');
-        fs.writeFileSync(historyPath, JSON.stringify(historyEntry, null, 2));
-        logStep(`Found recordId=${target.recordId} via history-api tool=${resolvedTool} status=${historyStatus}`);
-        logStep(`History record id: ${historyEntry.history_record_id || historyEntry.task?.history_id || '-'}`);
-        logStep(`History JSON: ${historyPath}`);
-        maybeEmitJson(args, {
-          ok: true,
-          command: 'find-record',
-          found: true,
-          source: 'history-api',
-          recordId: target.recordId,
-          tool: resolvedTool,
-          status: historyStatus,
-          historyRecordId: historyEntry.history_record_id || historyEntry.task?.history_id || null,
-          historyPath
-        });
-        return;
-      }
-
-      const loadedCards = await collectLoadedRecordCards(page, 20);
-      const snapshot = await maybeSaveSnapshot(page, options, `find-record-${safeSlug(target.recordId)}`);
-      logStep(`Record ${target.recordId} was not found on tools ${toolCandidates.join(', ')}.${snapshot ? ` Saved snapshot: ${snapshot.screenshot}` : ''}`);
-      if (loadedCards.length) {
-        logStep(`Loaded card ids: ${loadedCards.map((card) => card.recordId).join(', ')}`);
-      }
-      maybeEmitJson(args, {
+  const page = runtime.page || await getMainPage(context);
+  const toolCandidates = buildToolCandidates(target.tool || args.tool || null);
+  const located = await locateRecordAcrossTools(page, target.recordId, toolCandidates);
+  const locator = located.record?.locator || null;
+  if (!locator) {
+    const historyEntry = await fetchHistoryEntry(page, target.recordId).catch(() => null);
+    if (historyEntry) {
+      const resolvedTool = inferToolFromHistoryEntry(historyEntry) || located.tool;
+      const historyStatus = historyEntryStatusLabel(historyEntry) || '-';
+      const historyPath = artifactPath(options.artifactsDir, `find-record-${safeSlug(target.recordId)}-history`, 'json');
+      fs.writeFileSync(historyPath, JSON.stringify(historyEntry, null, 2));
+      logStep(`Found recordId=${target.recordId} via history-api tool=${resolvedTool} status=${historyStatus}`);
+      logStep(`History record id: ${historyEntry.history_record_id || historyEntry.task?.history_id || '-'}`);
+      logStep(`History JSON: ${historyPath}`);
+      return {
         ok: true,
         command: 'find-record',
-        found: false,
-        source: 'none',
+        found: true,
+        source: 'history-api',
         recordId: target.recordId,
-        toolCandidates,
-        loadedRecordIds: loadedCards.map((card) => card.recordId),
-        screenshot: snapshot?.screenshot || null,
-        snapshotJson: snapshot?.jsonPath || null,
-        snapshotText: snapshot?.textPath || null
-      });
-      return;
+        tool: resolvedTool,
+        status: historyStatus,
+        historyRecordId: historyEntry.history_record_id || historyEntry.task?.history_id || null,
+        historyPath
+      };
     }
 
-    const cardText = normalizeWhitespace(await locator.innerText().catch(() => ''));
-    const cardStatus = inferRecordStatus(cardText);
-    const screenshot = artifactPath(options.artifactsDir, `record-${safeSlug(target.recordId)}`, 'png');
-    await locator.screenshot({ path: screenshot });
-    logStep(`Found recordId=${target.recordId} tool=${located.tool} status=${cardStatus || '-'}`);
-    logStep(`Card text: ${truncateText(cardText, 200)}`);
-    logStep(`Card screenshot: ${screenshot}`);
-    maybeEmitJson(args, {
+    const loadedCards = await collectLoadedRecordCards(page, 20);
+    const snapshot = await maybeSaveSnapshot(page, options, `find-record-${safeSlug(target.recordId)}`);
+    logStep(`Record ${target.recordId} was not found on tools ${toolCandidates.join(', ')}.${snapshot ? ` Saved snapshot: ${snapshot.screenshot}` : ''}`);
+    if (loadedCards.length) {
+      logStep(`Loaded card ids: ${loadedCards.map((card) => card.recordId).join(', ')}`);
+    }
+    return {
       ok: true,
       command: 'find-record',
-      found: true,
-      source: 'dom',
+      found: false,
+      source: 'none',
       recordId: target.recordId,
-      tool: located.tool,
-      status: cardStatus || null,
-      cardText,
-      screenshot
-    });
+      toolCandidates,
+      loadedRecordIds: loadedCards.map((card) => card.recordId),
+      screenshot: snapshot?.screenshot || null,
+      snapshotJson: snapshot?.jsonPath || null,
+      snapshotText: snapshot?.textPath || null
+    };
+  }
+
+  const cardText = normalizeWhitespace(await locator.innerText().catch(() => ''));
+  const cardStatus = inferRecordStatus(cardText);
+  const screenshot = artifactPath(options.artifactsDir, `record-${safeSlug(target.recordId)}`, 'png');
+  await locator.screenshot({ path: screenshot });
+  logStep(`Found recordId=${target.recordId} tool=${located.tool} status=${cardStatus || '-'}`);
+  logStep(`Card text: ${truncateText(cardText, 200)}`);
+  logStep(`Card screenshot: ${screenshot}`);
+  return {
+    ok: true,
+    command: 'find-record',
+    found: true,
+    source: 'dom',
+    recordId: target.recordId,
+    tool: located.tool,
+    status: cardStatus || null,
+    cardText,
+    screenshot
+  };
+}
+
+async function commandFindRecord(args) {
+  const options = parseCommonOptions(args);
+  const context = await launchContext(options);
+  try {
+    const payload = await executeFindRecord(args, options, context);
+    maybeEmitJson(args, payload);
   } finally {
     await context.close();
   }
@@ -4814,6 +4833,16 @@ async function executeDaemonCommand(state, request) {
       return executeCanvasOpenProject(args, options, context, { daemonState: state });
     case 'canvas-rename-project':
       return executeCanvasRenameProject(args, options, context, { daemonState: state });
+    case 'record-status': {
+      // Use a dedicated statusPage so record lookups never navigate mainPage
+      // away from the generate/canvas page that is being kept warm.
+      const statusPage = await ensureDaemonStatusPage(state, context);
+      return executeRecordStatus(args, options, context, { page: statusPage });
+    }
+    case 'find-record': {
+      const statusPage = await ensureDaemonStatusPage(state, context);
+      return executeFindRecord(args, options, context, { page: statusPage });
+    }
     default:
       throw new Error(`Unsupported daemon command: ${request.command}`);
   }
@@ -4970,6 +4999,12 @@ Optional flags:
   --reference-file /abs/path[,/abs/path2]
   --no-daemon true|false
   --daemon-idle-timeout-ms 120000
+
+Daemon-routed commands (reuse browser across calls):
+  generate, canvas-prompt, canvas-create-project, canvas-open-project,
+  canvas-rename-project, record-status, find-record
+  record-status and find-record use a separate page inside the daemon so
+  they never interfere with generate/canvas-prompt page state.
   In 全能参考 mode, uploaded references can be mentioned in --prompt as @图片1, @图片2, @视频1, @音频1
   --image-file /abs/path[,/abs/path2]`);
 }

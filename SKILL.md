@@ -7,15 +7,35 @@ description: Automate JiMeng (即梦AI at jimeng.jianying.com), Seedance video g
 
 Use the bundled Playwright driver for JiMeng.
 
-Default workflow:
+Default workflow for image:
 
 1. Ensure login
-2. Submit an image or video task
-3. Track it by `record-id`
-4. Cancel a queued video task if needed
-5. Download the finished result
+2. `generate --tool image` — returns `recordId`
+3. `download-record --wait-complete true` — waits and downloads
+
+Default workflow for video (async — video can queue for hours):
+
+1. Ensure login
+2. `generate --tool video` — submits and returns `recordId` immediately, does not wait
+3. `record-status --record-id <id>` — poll until `isComplete=true`
+4. `download-record --record-id <id>` — download once complete
 
 Always identify tasks by `record-id`, not by page order.
+
+## Daemon
+
+Most commands reuse a background browser daemon. It starts automatically and
+shuts itself down after 10 minutes of idle time. No manual management needed.
+
+Commands routed through the daemon:
+`generate`, `canvas-prompt`, `canvas-create-project`, `canvas-open-project`,
+`canvas-rename-project`, `record-status`, `find-record`
+
+`record-status` and `find-record` use a dedicated page inside the daemon so
+polling never disturbs the generate/canvas page being kept warm.
+
+To opt out: `--no-daemon true`
+To change idle timeout: `--daemon-idle-timeout-ms <ms>` (default `600000`)
 
 ## Setup
 
@@ -206,7 +226,8 @@ Observed video options:
 
 Behavior:
 
-- Usually returns `recordId` on success.
+- Submits the task and returns immediately. Does not wait for generation to finish.
+- Usually returns `recordId` on success. Use `record-status` to poll and `download-record` to fetch the file.
 - Supports pure text, `全能参考`, and `首尾帧`.
 - One video task produces `1` MP4.
 - For hot models, inspect `serverAccepted`, `historyRecordId`, `serverRet`, and `serverErrmsg`.
@@ -261,7 +282,8 @@ node scripts/jimeng-browser.js download-record --record-id <record-id> --wait-co
 - Video records download `1` MP4.
 - Older records can still be recovered through the history API fallback.
 - For partial image records, download every successful image that exists and record the counts in `record-download.json`.
-- Default wait timeout is `900000` ms. For hot queues, poll with `record-status` first or increase the timeout.
+- For video: poll with `record-status` first until `isComplete=true`, then call `download-record` without `--wait-complete`. This avoids blocking the daemon queue for hours.
+- `--wait-complete true` is fine for image tasks (fast). For video tasks it blocks the caller for the full generation duration — avoid it unless you have a specific reason.
 
 ## Video reference-mode rules
 
