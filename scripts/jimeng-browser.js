@@ -3744,42 +3744,38 @@ async function commandCanvasRenameProject(args) {
   }
 }
 
-async function executeCanvasPrompt(args, options, context, runtime = {}) {
-  const prompt = args.prompt;
-  if (!prompt) {
-    throw new Error('The canvas-prompt command requires --prompt "..."');
-  }
-
-  const projectPage = await resolveCanvasPromptTargetPage(context, args, options, runtime);
-  if (await pageLooksLoggedOut(projectPage)) {
-    throw new Error('JiMeng is not logged in. Run the login command before using a canvas project.');
-  }
-
-  let target = await ensureCanvasConversationOpen(projectPage);
-  if (!target) {
-    throw new Error('Could not find the canvas project conversation editor.');
-  }
-
-  const kind = normalizeCanvasKind(args.kind);
+// Core canvas-prompt execution on an already-resolved page.
+// Called by executeCanvasPrompt (after project resolution) and by
+// executeGenerate when JiMeng's generate page has been redesigned to the
+// canvas-style conversation UI.
+async function executeCanvasPromptOnPage(page, tool, args, options) {
+  const rawPrompt = args.prompt;
+  const composedPrompt = buildCanvasPrompt(rawPrompt);
+  const kind = normalizeCanvasKind(args.kind || tool || 'auto');
   let resolvedTool = kind === 'auto' ? null : kind;
+
+  let target = await ensureCanvasConversationOpen(page);
+  if (!target) {
+    throw new Error('Could not find the canvas conversation editor on the generate page.');
+  }
+
   if (resolvedTool) {
-    await selectCanvasConversationTool(projectPage, resolvedTool);
+    await selectCanvasConversationTool(page, resolvedTool);
     if (resolvedTool === 'image') {
-      await configureImageOptions(projectPage, args);
+      await configureImageOptions(page, args);
     } else if (resolvedTool === 'video') {
-      await configureVideoOptions(projectPage, args);
+      await configureVideoOptions(page, args);
     }
-    target = await ensureCanvasConversationOpen(projectPage);
+    target = await ensureCanvasConversationOpen(page);
     if (!target) {
-      throw new Error('Could not find the canvas project conversation editor after switching tools.');
+      throw new Error('Could not find the canvas conversation editor after switching tools.');
     }
   }
 
-  const composedPrompt = buildCanvasPrompt(prompt);
   if (!resolvedTool) {
-    if (projectPage.url().includes('type=video')) {
+    if (page.url().includes('type=video')) {
       resolvedTool = 'video';
-    } else if (projectPage.url().includes('type=image')) {
+    } else if (page.url().includes('type=image')) {
       resolvedTool = 'image';
     }
   }
@@ -3794,20 +3790,20 @@ async function executeCanvasPrompt(args, options, context, runtime = {}) {
 
   if (uploadBeforePrompt) {
     uploadWorked = resolvedTool === 'video'
-      ? await maybeUploadVideoReferences(projectPage, args)
-      : await maybeUploadImage(projectPage, genericReferenceInput);
+      ? await maybeUploadVideoReferences(page, args)
+      : await maybeUploadImage(page, genericReferenceInput);
     if (needsReferenceMentions && !uploadWorked) {
-      throw new Error(`Could not upload the canvas ${resolvedTool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
+      throw new Error(`Could not upload the ${resolvedTool === 'video' ? 'video reference files' : 'reference image files'} before inserting @ mentions.`);
     }
     if (uploadWorked && resolvedTool === 'video') {
-      await waitForVideoReferenceEditorReady(projectPage, 10000);
+      await waitForVideoReferenceEditorReady(page, 10000);
     }
     if (uploadWorked && needsReferenceMentions) {
-      await projectPage.waitForTimeout(5000);
+      await page.waitForTimeout(5000);
     }
-    target = await ensureCanvasConversationOpen(projectPage);
+    target = await ensureCanvasConversationOpen(page);
     if (!target) {
-      throw new Error(`Could not find the canvas project conversation editor after ${resolvedTool === 'video' ? 'video reference' : 'reference image'} upload.`);
+      throw new Error('Could not find the canvas conversation editor after reference upload.');
     }
     if (needsReferenceMentions && target.type !== 'editor') {
       throw new Error('Could not find the canvas rich-text editor needed for @ mentions.');
@@ -3818,23 +3814,19 @@ async function executeCanvasPrompt(args, options, context, runtime = {}) {
 
   if (!uploadBeforePrompt) {
     uploadWorked = resolvedTool === 'video'
-      ? await maybeUploadVideoReferences(projectPage, args)
-      : await maybeUploadImage(projectPage, genericReferenceInput);
+      ? await maybeUploadVideoReferences(page, args)
+      : await maybeUploadImage(page, genericReferenceInput);
   }
 
   if (uploadRequested) {
-    const uploadLabel = resolvedTool === 'video'
-      ? 'Uploaded the canvas video reference file(s).'
-      : 'Uploaded the canvas reference image file(s).';
-    const uploadMissLabel = resolvedTool === 'video'
-      ? 'Did not find a file input for the canvas video reference upload.'
-      : 'Did not find a file input for the canvas reference image upload.';
-    logStep(uploadWorked ? uploadLabel : uploadMissLabel);
+    logStep(uploadWorked
+      ? `Uploaded the ${resolvedTool === 'video' ? 'video reference file(s)' : 'reference image file(s)'}.`
+      : `Did not find a file input for the ${resolvedTool === 'video' ? 'video reference' : 'reference image'} upload.`);
   }
 
-  const submitButton = await findSubmitButton(projectPage);
+  const submitButton = await findSubmitButton(page);
   if (!submitButton) {
-    throw new Error('Could not find the canvas project submit button.');
+    throw new Error('Could not find the submit button on the generate conversation page.');
   }
   const submitRetries = integerFlag(args['submit-retries'], resolvedTool === 'video' ? 2 : 0);
   const retryDelayMs = integerFlag(args['submit-retry-delay-ms'], resolvedTool === 'video' ? 60000 : 15000);
@@ -3850,50 +3842,50 @@ async function executeCanvasPrompt(args, options, context, runtime = {}) {
 
   for (let attempt = 0; attempt <= submitRetries; attempt += 1) {
     attemptCount = attempt + 1;
-    const previousRecordIds = new Set((await collectLoadedRecordCards(projectPage)).map((card) => card.recordId));
-    beforeSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-before-submit');
+    const previousRecordIds = new Set((await collectLoadedRecordCards(page)).map((card) => card.recordId));
+    beforeSnapshot = await maybeSaveSnapshot(page, options, `generate-before-submit-${resolvedTool || 'auto'}`);
 
-    await checkAndThrowInsufficientCredits(projectPage);
-    await closeAnyModal(projectPage);
+    await checkAndThrowInsufficientCredits(page);
+    await closeAnyModal(page);
 
-    const generateApiPromise = waitForGenerateApiResult(projectPage, Math.min(options.timeoutMs, 30000));
+    const generateApiPromise = waitForGenerateApiResult(page, Math.min(options.timeoutMs, 30000));
     await submitButton.locator.click({ force: true });
-    await projectPage.waitForTimeout(500);
+    await page.waitForTimeout(500);
 
-    const modalClosed = await closeAnyModal(projectPage);
+    const modalClosed = await closeAnyModal(page);
     if (modalClosed) {
-      await projectPage.waitForTimeout(300);
+      await page.waitForTimeout(300);
       await submitButton.locator.click({ force: true });
-      await projectPage.waitForTimeout(500);
+      await page.waitForTimeout(500);
     }
 
-    await checkAndThrowInsufficientCredits(projectPage);
+    await checkAndThrowInsufficientCredits(page);
 
     generateApiResult = await generateApiPromise;
     if (!submitRequestPath && generateApiResult?.requestBody) {
-      submitRequestPath = artifactPath(options.artifactsDir, 'canvas-submit-request', 'json');
+      submitRequestPath = artifactPath(options.artifactsDir, `generate-submit-request-${resolvedTool || 'auto'}`, 'json');
       fs.writeFileSync(submitRequestPath, JSON.stringify(generateApiResult.requestBody, null, 2));
     }
 
     if (generateApiResult && !generateApiResult.accepted) {
-      const serverMessage = `Server rejected canvas submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
+      const serverMessage = `Server rejected submit ret=${generateApiResult.ret ?? '-'} errmsg=${generateApiResult.errmsg || '-'}`;
       if (attempt < submitRetries) {
         logStep(`${serverMessage}. Waiting ${retryDelayMs}ms before retrying.`);
-        await projectPage.waitForTimeout(retryDelayMs);
-        await dismissBlockingOverlays(projectPage);
+        await page.waitForTimeout(retryDelayMs);
+        await dismissBlockingOverlays(page);
         continue;
       }
       throw new Error(serverMessage);
     }
 
-    const submitState = await waitForSubmitState(projectPage, {
+    const submitState = await waitForSubmitState(page, {
       previousIds: previousRecordIds,
       prompt: composedPrompt,
       tool: resolvedTool,
       timeoutMs: Math.min(options.timeoutMs, resolvedTool === 'video' ? 30000 : 20000)
     });
-    await projectPage.waitForTimeout(integerFlag(args['wait-after-submit-ms'], 8000));
-    afterSnapshot = await maybeSaveSnapshot(projectPage, options, 'canvas-after-submit');
+    await page.waitForTimeout(integerFlag(args['wait-after-submit-ms'], 2000));
+    afterSnapshot = await maybeSaveSnapshot(page, options, `generate-after-submit-${resolvedTool || 'auto'}`);
 
     if (submitState.recordCard) {
       trackedRecord = {
@@ -3909,7 +3901,7 @@ async function executeCanvasPrompt(args, options, context, runtime = {}) {
     if (submitState.signal === 'video-pending') {
       submitSignal = submitState.signal;
       pendingMarker = submitState.pendingMarker || null;
-      trackedRecord = await waitForDelayedRecordCard(projectPage, {
+      trackedRecord = await waitForDelayedRecordCard(page, {
         prompt: composedPrompt,
         timeoutMs: Math.min(options.timeoutMs, recordIdWaitMs),
         reloadIntervalMs: 15000
@@ -3936,11 +3928,59 @@ async function executeCanvasPrompt(args, options, context, runtime = {}) {
     }
 
     if (attempt < submitRetries) {
-      logStep(`No clear canvas success signal after submit attempt ${attemptCount}/${submitRetries + 1}. Waiting ${retryDelayMs}ms before retrying.`);
-      await projectPage.waitForTimeout(retryDelayMs);
-      await dismissBlockingOverlays(projectPage);
+      logStep(`No clear success signal after submit attempt ${attemptCount}/${submitRetries + 1}. Waiting ${retryDelayMs}ms before retrying.`);
+      await page.waitForTimeout(retryDelayMs);
+      await dismissBlockingOverlays(page);
     }
   }
+
+  let registryEntry = null;
+  if (trackedRecord && resolvedTool) {
+    registryEntry = createTrackedRecordEntry(args, resolvedTool, composedPrompt, trackedRecord);
+    appendRegistryEntry(options.registryPath, registryEntry);
+    logStep(`Tracked recordId=${registryEntry.recordId}`);
+  } else if (generateApiResult?.accepted) {
+    logStep(`Server accepted the submit, but no record card appeared before the timeout. historyRecordId=${generateApiResult.historyRecordId || '-'} taskId=${generateApiResult.taskId || '-'}`);
+  } else {
+    logStep('Submit state stayed ambiguous and no new record card appeared before the timeout. Inspect the post-submit snapshot.');
+  }
+
+  return {
+    ok: true,
+    resolvedTool,
+    composedPrompt,
+    submitSignal,
+    pendingMarker,
+    attemptCount,
+    recordId: registryEntry?.recordId || null,
+    historyRecordId: trackedRecord?.historyRecordId || generateApiResult?.historyRecordId || null,
+    taskId: trackedRecord?.taskId || generateApiResult?.taskId || null,
+    submitId: generateApiResult?.submitId || null,
+    serverAccepted: generateApiResult?.accepted || false,
+    serverRet: generateApiResult?.ret ?? null,
+    serverErrmsg: generateApiResult?.errmsg ?? null,
+    status: registryEntry?.status || (generateApiResult?.accepted ? 'server-accepted-no-record-id' : 'submitted-no-record-id'),
+    beforeSnapshot: beforeSnapshot?.screenshot || null,
+    afterSnapshot: afterSnapshot?.screenshot || null,
+    submitRequestPath,
+    trackingSaved: Boolean(registryEntry),
+    registryEntry
+  };
+}
+
+async function executeCanvasPrompt(args, options, context, runtime = {}) {
+  const prompt = args.prompt;
+  if (!prompt) {
+    throw new Error('The canvas-prompt command requires --prompt "..."');
+  }
+
+  const projectPage = await resolveCanvasPromptTargetPage(context, args, options, runtime);
+  if (await pageLooksLoggedOut(projectPage)) {
+    throw new Error('JiMeng is not logged in. Run the login command before using a canvas project.');
+  }
+
+  const kind = normalizeCanvasKind(args.kind);
+  const result = await executeCanvasPromptOnPage(projectPage, kind === 'auto' ? null : kind, args, options);
 
   const bodyText = await getBodyText(projectPage, 12000);
   const summary = summarizeCanvasProjectState(bodyText);
@@ -3952,44 +3992,37 @@ async function executeCanvasPrompt(args, options, context, runtime = {}) {
     logStep(`Canvas project state: ${summary.status}${summary.progressText ? ` (${summary.progressText})` : ''}`);
   }
 
-  let registryEntry = null;
-  if (trackedRecord && resolvedTool) {
-    registryEntry = createTrackedRecordEntry(args, resolvedTool, composedPrompt, trackedRecord);
-    appendRegistryEntry(options.registryPath, registryEntry);
-    logStep(`Tracked recordId=${registryEntry.recordId}`);
-  }
-
   return {
-    ok: true,
+    ok: result.ok,
     command: 'canvas-prompt',
     projectId,
     projectUrl: projectPage.url(),
     projectTitle: await projectPage.title(),
     projectName,
     kind,
-    tool: resolvedTool,
-    prompt: composedPrompt,
-    recordId: registryEntry?.recordId || null,
-    historyRecordId: trackedRecord?.historyRecordId || generateApiResult?.historyRecordId || null,
-    taskId: trackedRecord?.taskId || generateApiResult?.taskId || null,
-    submitId: generateApiResult?.submitId || null,
-    submitSignal,
-    pendingMarker,
-    attemptCount,
-    serverAccepted: generateApiResult?.accepted || false,
-    serverRet: generateApiResult?.ret ?? null,
-    serverErrmsg: generateApiResult?.errmsg ?? null,
+    tool: result.resolvedTool,
+    prompt: result.composedPrompt,
+    recordId: result.recordId,
+    historyRecordId: result.historyRecordId,
+    taskId: result.taskId,
+    submitId: result.submitId,
+    submitSignal: result.submitSignal,
+    pendingMarker: result.pendingMarker,
+    attemptCount: result.attemptCount,
+    serverAccepted: result.serverAccepted,
+    serverRet: result.serverRet,
+    serverErrmsg: result.serverErrmsg,
     status: summary.status,
     progressText: summary.progressText,
-    beforeSnapshot: beforeSnapshot?.screenshot || null,
-    afterSnapshot: afterSnapshot?.screenshot || null,
-    screenshot: afterSnapshot?.screenshot || null,
-    snapshotJson: afterSnapshot?.jsonPath || null,
-    snapshotText: afterSnapshot?.textPath || null,
-    submitRequestPath,
+    beforeSnapshot: result.beforeSnapshot,
+    afterSnapshot: result.afterSnapshot,
+    screenshot: result.afterSnapshot,
+    snapshotJson: null,
+    snapshotText: null,
+    submitRequestPath: result.submitRequestPath,
     registryPath: options.registryPath,
-    trackingSaved: Boolean(registryEntry),
-    registryEntry
+    trackingSaved: result.trackingSaved,
+    registryEntry: result.registryEntry
   };
 }
 
@@ -4003,6 +4036,26 @@ async function commandCanvasPrompt(args) {
   } finally {
     await context.close();
   }
+}
+
+async function isNewConversationalGeneratePage(page) {
+  // JiMeng redesigned /ai-tool/generate/?type=video (and image) into a
+  // canvas-style conversation UI. Detect it by the presence of the ProseMirror
+  // rich-text editor and the absence of the old textarea submit flow.
+  try {
+    const editor = page.locator('[role="textbox"].ProseMirror').first();
+    if (await isVisible(editor)) {
+      return true;
+    }
+    // Fallback: check body text for the greeting shown on the new page
+    const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+    if (bodyText.includes('你好，想创作什么')) {
+      return true;
+    }
+  } catch {
+    // ignore detection errors
+  }
+  return false;
 }
 
 async function executeGenerate(args, options, context, runtime = {}) {
@@ -4025,6 +4078,41 @@ async function executeGenerate(args, options, context, runtime = {}) {
   await dismissBlockingOverlays(page);
   if (await pageLooksLoggedOut(page)) {
     throw new Error('JiMeng is not logged in. Run the login command before generate.');
+  }
+
+  // JiMeng redesigned the generate page into a canvas-style conversation UI.
+  // Detect it and delegate to the canvas-prompt execution path.
+  if (await isNewConversationalGeneratePage(page)) {
+    logStep(`Detected new conversational UI at ${page.url()}. Routing generate to canvas-prompt flow.`);
+    const canvasArgs = { ...args, kind: tool };
+    const canvasPayload = await executeCanvasPromptOnPage(page, tool, canvasArgs, options);
+    return {
+      ok: canvasPayload.ok,
+      command: 'generate',
+      tool,
+      prompt,
+      recordId: canvasPayload.recordId,
+      expectedImageCount: tool === 'image' ? 4 : null,
+      expectedVideoCount: tool === 'video' ? 1 : null,
+      beforeSnapshot: canvasPayload.beforeSnapshot,
+      afterSnapshot: canvasPayload.afterSnapshot,
+      registryPath: options.registryPath,
+      trackingSaved: canvasPayload.trackingSaved,
+      submitSignal: canvasPayload.submitSignal,
+      pendingMarker: canvasPayload.pendingMarker,
+      attemptCount: canvasPayload.attemptCount,
+      serverAccepted: canvasPayload.serverAccepted,
+      historyRecordId: canvasPayload.historyRecordId,
+      taskId: canvasPayload.taskId,
+      submitId: canvasPayload.submitId,
+      serverRet: canvasPayload.serverRet,
+      serverErrmsg: canvasPayload.serverErrmsg,
+      serverHttpStatus: null,
+      serverStatus: canvasPayload.status,
+      submitRequestPath: canvasPayload.submitRequestPath,
+      status: canvasPayload.status,
+      registryEntry: canvasPayload.registryEntry
+    };
   }
 
   if (tool === 'image') {
