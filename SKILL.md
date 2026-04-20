@@ -226,6 +226,7 @@ Observed video options:
 
 Behavior:
 
+- As of 2026-04-20, JiMeng's generate page uses a canvas-style conversation UI. The command detects this automatically and routes through the same path as `canvas-prompt`. No flag changes needed.
 - Submits the task and returns immediately. Does not wait for generation to finish.
 - Usually returns `recordId` on success. Use `record-status` to poll and `download-record` to fetch the file.
 - Supports pure text, `全能参考`, and `首尾帧`.

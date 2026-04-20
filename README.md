@@ -240,6 +240,13 @@ Some video modes use JiMeng mention tokens inside the prompt to bind uploaded ma
 
 Important: plain text like `@图片1` is not enough by itself. The script converts these tokens into real JiMeng mention tags before submit.
 
+## Generate page UI
+
+As of 2026-04-20, JiMeng replaced `/ai-tool/generate/?type=video` and
+`/ai-tool/generate/?type=image` with a canvas-style conversation UI. The
+`generate` command detects this automatically and routes through the same
+execution path as `canvas-prompt`. No flag changes are needed.
+
 ## Canvas projects
 
 The real canvas home route is:
@@ -253,7 +260,7 @@ Observed behavior:
 - clicking the project name in the top-left header enters inline rename mode
 - use the top-right `对话` drawer as the project generation entry
 - the drawer itself exposes `图片生成` and `视频生成`
-- the drawer controls behave like the normal generate page, so the same model/aspect/resolution/duration/reference-mode flags can be reused there
+- the drawer controls use the same conversation UI as the generate page, so the same model/aspect/resolution/duration/reference-mode flags apply
 
 Current project-generation rule:
 
