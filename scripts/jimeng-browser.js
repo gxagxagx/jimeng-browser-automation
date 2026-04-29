@@ -3982,8 +3982,20 @@ async function executeCanvasPrompt(args, options, context, runtime = {}) {
   const kind = normalizeCanvasKind(args.kind);
   const result = await executeCanvasPromptOnPage(projectPage, kind === 'auto' ? null : kind, args, options);
 
-  const bodyText = await getBodyText(projectPage, 12000);
-  const summary = summarizeCanvasProjectState(bodyText);
+  let summary = { status: null, progressText: null };
+  if (result.recordId) {
+    const cardRecord = await locateRecordWithStatus(projectPage, result.recordId).catch(() => null);
+    if (cardRecord) {
+      summary = summarizeCanvasProjectState(cardRecord.text);
+      if (cardRecord.status) {
+        summary.status = cardRecord.status;
+      }
+    }
+  }
+  if (!summary.status) {
+    const bodyText = await getBodyText(projectPage, 12000);
+    summary = summarizeCanvasProjectState(bodyText);
+  }
   const projectId = extractCanvasProjectId(projectPage.url());
   const projectName = await getCanvasProjectName(projectPage);
 
